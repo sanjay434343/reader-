@@ -26,7 +26,7 @@ function setCache(key, data, ttl) {
 // -----------------------------------------
 function chunkText(text, maxSize = 4000) {
   const chunks = [];
-  text = text.replace(/\s+/g, " ").trim();   // clean \n and extra spaces
+  text = text.replace(/\s+/g, " ").trim();
 
   for (let i = 0; i < text.length; i += maxSize) {
     chunks.push(text.slice(i, i + maxSize));
@@ -94,7 +94,7 @@ export default async function handler(req, res) {
       .replace(/var .*?;/gs, "")
       .trim();
 
-    // REMOVE noise phrases
+    // REMOVE common noises
     const REMOVE_PHRASES = [
       "ADVERTISEMENT","ADVERTISEMENT CONTINUE READING",
       "30 SEC READ","READ |","CLICK HERE","SUBSCRIBE NOW",
@@ -169,7 +169,7 @@ export default async function handler(req, res) {
     const videos = [...new Set(rawVideos)];
 
     // -----------------------------------------
-    // LINKS CLEANED
+    // LINKS
     // -----------------------------------------
     const BAD_LINKS = ["facebook.com","twitter.com","x.com","instagram.com","whatsapp.com","share="];
 
@@ -183,18 +183,16 @@ export default async function handler(req, res) {
     links = [...new Set(links)];
 
     // -----------------------------------------
-    // FINAL RESPONSE
+    // FINAL RESPONSE (NO content)
     // -----------------------------------------
     const result = {
       url,
       title: $("title").text().trim(),
-      chunks,        // <-- chunked text for pollinations
-      content,       // cleaned full content
+      chunks,         // only chunked content
       images,
       videos,
       links,
       length: {
-        textLength: content.length,
         chunks: chunks.length,
         images: images.length,
         videos: videos.length,
