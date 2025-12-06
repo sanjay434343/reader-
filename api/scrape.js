@@ -2,10 +2,10 @@ import axios from "axios";
 import * as cheerio from "cheerio";
 
 // -----------------------------------------
-// GLOBAL CACHE (serverless warm-memory safe)
+// GLOBAL CACHE
 // -----------------------------------------
 let CACHE = {};
-const DEFAULT_TTL = 600 * 1000; // 10 minutes
+const DEFAULT_TTL = 600 * 1000;
 
 function getCache(key) {
   const entry = CACHE[key];
@@ -24,35 +24,23 @@ function setCache(key, data, ttl) {
 // -----------------------------------------
 
 export default async function handler(req, res) {
-  // -----------------------------------------
-  // ENABLE CORS FOR ALL ORIGINS
-  // -----------------------------------------
+  // ENABLE CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "*");
 
-  // Handle preflight OPTIONS request
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-  // -----------------------------------------
+  if (req.method === "OPTIONS") return res.status(200).end();
 
   try {
     const { url, ttl } = req.query;
     const cacheTTL = ttl ? parseInt(ttl) * 1000 : DEFAULT_TTL;
-
     if (!url) return res.status(400).json({ error: "URL is required." });
 
     const cacheKey = `scrape:${url}`;
     const cached = getCache(cacheKey);
+    if (cached) return res.status(200).json({ success: true, cached: true, ...cached });
 
-    if (cached) {
-      return res.status(200).json({ success: true, cached: true, ...cached });
-    }
-
-    // -----------------------------
-    // FETCH HTML
-    // -----------------------------
+    // Fetch HTML
     const response = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0 Chrome/120 Safari/537.36" }
     });
@@ -60,80 +48,74 @@ export default async function handler(req, res) {
     const html = response.data;
     const $ = cheerio.load(html);
 
-    // -----------------------------
-    // REMOVE JUNK
-    // -----------------------------
+    // Remove junk
     const REMOVE_SELECTORS = [
-      "script", "style", "noscript", "header", "footer", "nav",
-      "iframe", "form", "button", "svg", "canvas",
-      ".ads", ".ad", ".advertisement", ".sponsored", ".promo",
-      ".share", ".social", ".share-buttons", ".cookie", ".cookie-banner",
-      ".subscription", ".newsletter", ".breadcrumb", ".popup", ".modal"
+      "script","style","noscript","header","footer","nav",
+      "iframe","form","button","svg","canvas",
+      ".ads",".ad",".advertisement",".sponsored",".promo",
+      ".share",".social",".cookie",".newsletter",
+      ".popup",".modal",".breadcrumb",".banner"
     ];
-
     REMOVE_SELECTORS.forEach(sel => $(sel).remove());
 
-    // -----------------------------
-    // MAIN CONTENT EXTRACTION
-    // -----------------------------
+    // MAIN CONTENT
     const MAIN_SELECTORS = [
-      "article",
-      ".article",
-      ".post",
-      ".main-content",
-      ".story",
-      ".content",
-      "#content"
+      "article",".article",".post",".main-content",
+      ".story",".content","#content"
     ];
 
     let content = "";
-
     for (let sel of MAIN_SELECTORS) {
-      if ($(sel).text().trim().length > 100) {
+      if ($(sel).text().trim().length > 120) {
         content = $(sel).text();
         break;
       }
     }
+    if (content.length < 120) content = $("body").text();
 
-    if (content.trim().length < 100) {
-      content = $("body").text();
-    }
-
+    // BASIC CLEANING
     content = content
       .replace(/\s+/g, " ")
+      .replace(/<!--.*?-->/gs, "")
       .replace(/function.*?\}/gs, "")
       .replace(/var .*?;/gs, "")
-      .replace(/<!--.*?-->/gs, "")
       .trim();
 
-    // -----------------------------
-    // CONTENT IMAGES ONLY
-    // -----------------------------
-    const VALID_EXT = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
-
-    const BAD_PATTERNS = [
-      "logo", "icon", "sprite", "placeholder", "default",
-      "ads", "advert", "banner", "tracking", "analytics", "pixel"
+    // REMOVE USELESS NEWS PHRASES
+    const REMOVE_PHRASES = [
+      "ADVERTISEMENT","ADVERTISEMENT CONTINUE READING",
+      "30 SEC READ","READ |","CLICK HERE","SUBSCRIBE NOW",
+      "SCROLL TO CONTINUE","TRENDING","LIVE UPDATES",
+      "Premium Story","You May Like"
     ];
+
+    REMOVE_PHRASES.forEach(p => {
+      const regex = new RegExp(p, "gi");
+      content = content.replace(regex, "");
+    });
+
+    // REMOVE DUPLICATE SENTENCES
+    let sentences = content.split(/[.!?]+/).map(s => s.trim());
+    let uniqueSentences = [...new Set(sentences)];
+    content = uniqueSentences.join(". ").trim();
+
+    // ---------------------------------------------
+    // CONTENT IMAGES (clean + deduplicated)
+    // ---------------------------------------------
+    const VALID_EXT = [".jpg",".jpeg",".png",".webp",".gif"];
+    const BAD_PATTERNS = ["logo","icon","sprite","default","ads","pixel","banner"];
 
     const IMAGE_SELECTORS = [
-      "article img",
-      ".article img",
-      ".post img",
-      ".content img",
-      ".story img",
-      ".main-content img",
-      "img.wp-post-image",
-      "img.size-large",
-      "img.size-full"
+      "article img",".article img",".post img",".story img",
+      ".content img",".main-content img","img.size-large"
     ];
 
-    let imageList = [];
+    let rawImages = [];
 
     function isValidImage(src) {
       if (!src) return false;
       const lower = src.toLowerCase();
-      if (!VALID_EXT.some(ext => lower.includes(ext))) return false;
+      if (!VALID_EXT.some(e => lower.includes(e))) return false;
       if (BAD_PATTERNS.some(b => lower.includes(b))) return false;
       return true;
     }
@@ -141,90 +123,64 @@ export default async function handler(req, res) {
     IMAGE_SELECTORS.forEach(sel => {
       $(sel).each((i, el) => {
         let src = $(el).attr("src") || $(el).attr("data-src");
-        if (src && isValidImage(src)) {
-          try {
-            imageList.push(new URL(src, url).href);
-          } catch {}
+        if (isValidImage(src)) {
+          try { rawImages.push(new URL(src, url).href); } catch {}
         }
       });
     });
 
-    const images = [...new Set(imageList)];
+    const images = [...new Set(rawImages)];
 
-    // -----------------------------
-    // CONTENT VIDEOS ONLY
-    // -----------------------------
+    // ---------------------------------------------
+    // VIDEOS (deduplicated)
+    // ---------------------------------------------
     const VIDEO_SELECTORS = [
-      "article video",
-      "article iframe",
-      ".post video",
-      ".post iframe",
-      ".content iframe",
-      ".content video",
-      ".story iframe"
+      "article iframe",".content iframe",".post iframe",".story iframe",
+      ".content video","article video"
     ];
 
-    let videoList = [];
+    let rawVideos = [];
 
     VIDEO_SELECTORS.forEach(sel => {
       $(sel).each((i, el) => {
-        let src = $(el).attr("src") || $(el).attr("data-src");
+        let src = $(el).attr("src");
         if (src && src.startsWith("http")) {
-          try {
-            videoList.push(new URL(src, url).href);
-          } catch {}
+          try { rawVideos.push(new URL(src, url).href); } catch {}
         }
       });
     });
 
-    const videos = [...new Set(videoList)];
+    const videos = [...new Set(rawVideos)];
 
-    // -----------------------------
-    // META TAGS
-    // -----------------------------
-    const meta = {};
-    $("meta").each((i, el) => {
-      const name = $(el).attr("name") || $(el).attr("property");
-      const content = $(el).attr("content");
-      if (name && content) meta[name] = content;
-    });
+    // ---------------------------------------------
+    // LINKS (deduplicated + remove social)
+    // ---------------------------------------------
+    const BAD_LINKS = ["facebook.com","twitter.com","x.com","instagram.com","whatsapp.com","share="];
 
-    // -----------------------------
-    // CLEAN LINKS (REMOVE SOCIAL)
-    // -----------------------------
-    const BAD_LINKS = [
-      "facebook.com", "twitter.com", "x.com", "instagram.com",
-      "whatsapp.com", "share=", "intent"
-    ];
+    let rawLinks = $("a").map((i, el) => $(el).attr("href")).get();
 
-    let links = $("a")
-      .map((i, el) => $(el).attr("href"))
-      .get()
-      .filter(Boolean)
-      .map(href => {
-        try { return new URL(href, url).href; } catch { return null; }
-      })
-      .filter(Boolean)
-      .filter(l => !BAD_LINKS.some(b => l.includes(b)));
+    let links = rawLinks
+      .filter(h => h)
+      .map(h => { try { return new URL(h, url).href; } catch { return null; }})
+      .filter(h => h && !BAD_LINKS.some(b => h.includes(b)));
 
     links = [...new Set(links)];
 
-    // -----------------------------
-    // FINAL RESPONSE
-    // -----------------------------
+    // ---------------------------------------------
+    // RESPONSE
+    // ---------------------------------------------
     const result = {
       url,
       title: $("title").text().trim(),
-      meta,
       content,
       images,
       videos,
       links,
       length: {
         textLength: content.length,
-        imageCount: images.length,
-        videoCount: videos.length,
-        linkCount: links.length
+        images: images.length,
+        videos: videos.length,
+        links: links.length
       }
     };
 
@@ -232,10 +188,10 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ success: true, cached: false, ...result });
 
-  } catch (error) {
+  } catch (err) {
     return res.status(500).json({
-      error: "Failed to scrape page.",
-      details: error.message
+      error: "Scraping failed",
+      details: err.message
     });
   }
 }
