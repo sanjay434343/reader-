@@ -1,120 +1,146 @@
 import axios from "axios";
-import * as cheerio from "cheerio";
 
+// -------------------------------------------
+// CATEGORY KEYWORD MAP
+// -------------------------------------------
+const CATEGORY_KEYWORDS = {
+  news: ["breaking", "attack", "accident", "crime", "blast", "election", "protest"],
+  tech: ["android", "iphone", "google", "apple", "update", "software", "ai", "beta"],
+  sports: ["match", "score", "t20", "cricket", "football", "fifa", "ipl"],
+  business: ["market", "shares", "stock", "revenue", "startup", "funding"],
+  science: ["nasa", "research", "scientists", "discovery", "experiment"],
+  blogs: ["blog", "tutorial", "guide", "how to"]
+};
+
+// -------------------------------------------
+// DETECT CATEGORY FROM QUERY
+// -------------------------------------------
+function detectCategory(query) {
+  const q = query.toLowerCase();
+
+  for (let cat in CATEGORY_KEYWORDS) {
+    if (CATEGORY_KEYWORDS[cat].some(word => q.includes(word))) {
+      return cat;
+    }
+  }
+
+  return "general";
+}
+
+// -------------------------------------------
+// STRONG TITLE FILTERING LOGIC
+// -------------------------------------------
+function strongMatch(title, query) {
+  const t = title.toLowerCase();
+  const q = query.toLowerCase().split(" ");
+
+  // MUST contain all important words > 4 letters
+  const mustWords = q.filter(w => w.length > 4);
+
+  // OPTIONAL words for better context
+  const optionalWords = q.filter(w => w.length <= 4);
+
+  const hasMust = mustWords.every(w => t.includes(w));
+  const hasOptional = optionalWords.some(w => t.includes(w));
+
+  return hasMust && hasOptional;
+}
+
+// -------------------------------------------
+// MAIN API
+// -------------------------------------------
 export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-
-  if (req.method === "OPTIONS") return res.status(200).end();
-
   try {
     const { q } = req.query;
-    if (!q) return res.status(400).json({ error: "Query (q) is required" });
+    if (!q) return res.status(400).json({ error: "Query is required" });
 
-    const query = encodeURIComponent(q);
-    const keywords = q.toLowerCase().split(" ");
+    const category = detectCategory(q);
 
-    // CLEAN ARTICLE SELECTORS FOR EACH SITE
-    const SOURCES = [
-      // NEWS
-      { cat: "news", url: t => `https://indianexpress.com/?s=${t}`, selector: "a[href*='/article/']" },
-      { cat: "news", url: t => `https://www.ndtv.com/search?searchtext=${t}`, selector: "a[href*='/news/']" },
-      { cat: "news", url: t => `https://timesofindia.indiatimes.com/topic/${t}`, selector: "a[href*='articleshow']" },
-      { cat: "news", url: t => `https://www.bbc.co.uk/search?q=${t}`, selector: "a[href*='/news/']" },
+    // -------------------------------------------
+    // SOURCES TO SCRAPE BASED ON CATEGORY
+    // -------------------------------------------
+    const SOURCES = {
+      news: [
+        `https://indianexpress.com/?s=${encodeURIComponent(q)}`,
+        `https://timesofindia.indiatimes.com/topic/${encodeURIComponent(q)}`,
+        `https://www.bbc.co.uk/search?q=${encodeURIComponent(q)}`
+      ],
+      tech: [
+        `https://timesofindia.indiatimes.com/technology/searchresults.cms?query=${encodeURIComponent(q)}`,
+        `https://www.theverge.com/search?q=${encodeURIComponent(q)}`,
+        `https://www.gsmarena.com/results.php3?sQuickSearch=yes&sName=${encodeURIComponent(q)}`
+      ],
+      sports: [
+        `https://www.espncricinfo.com/search?q=${encodeURIComponent(q)}`,
+        `https://www.bbc.com/sport/search?q=${encodeURIComponent(q)}`
+      ],
+      business: [
+        `https://economictimes.indiatimes.com/topic/${encodeURIComponent(q)}`
+      ],
+      science: [
+        `https://www.livescience.com/search?searchTerm=${encodeURIComponent(q)}`,
+        `https://www.sciencedaily.com/search/?keyword=${encodeURIComponent(q)}`
+      ],
+      general: [
+        `https://www.google.com/search?q=${encodeURIComponent(q)}`
+      ]
+    };
 
-      // TECH
-      { cat: "tech", url: t => `https://techcrunch.com/search/${t}`, selector: "a.post-block__title__link" },
-      { cat: "tech", url: t => `https://www.theverge.com/search?q=${t}`, selector: "a[href*='/202']" },
-      { cat: "tech", url: t => `https://www.wired.com/search/?q=${t}`, selector: "a.archive-item-component__link" },
+    const targetSources = SOURCES[category];
 
-      // SPORTS
-      { cat: "sports", url: t => `https://www.cricbuzz.com/search?q=${t}`, selector: "a[href*='/cricket-news/']" },
-      { cat: "sports", url: t => `https://www.espn.com/search/results?q=${t}`, selector: "a[href*='/story/']" },
+    let results = [];
 
-      // BUSINESS
-      { cat: "business", url: t => `https://economictimes.indiatimes.com/topic/${t}`, selector: "a[href*='articleshow']" },
-
-      // SCIENCE
-      { cat: "science", url: t => `https://www.sciencedaily.com/search/?keyword=${t}`, selector: "a[href*='/releases/']" },
-      { cat: "science", url: t => `https://www.livescience.com/search?searchTerm=${t}`, selector: "a[href*='/news/']" },
-
-      // BLOGS
-      { cat: "blogs", url: t => `https://medium.com/search?q=${t}`, selector: "a[href*='/p/']" }
-    ];
-
-
-    const BAD_LINKS = [
-      "login", "signup", "account", "facebook.com", "twitter.com",
-      "instagram.com", "whatsapp", "share", "mailto", "javascript"
-    ];
-
-    async function scrape(src) {
+    // -------------------------------------------
+    // SCRAPE EACH SOURCE
+    // -------------------------------------------
+    for (let url of targetSources) {
       try {
-        const page = await axios.get(src.url(query), {
-          headers: { "User-Agent": "Mozilla/5.0" }
-        });
+        const html = await axios.get(url, {
+          headers: { "User-Agent": "Mozilla/5.0 Chrome/120 Safari/537.36" }
+        }).then(res => res.data);
 
-        const $ = cheerio.load(page.data);
-        let out = [];
+        // Extract links using regex (lightweight)
+        const linkRegex = /<a[^>]+href="([^"]+)"[^>]*>(.*?)<\/a>/gi;
 
-        $(src.selector).each((i, el) => {
-          const href = $(el).attr("href");
-          let title = $(el).text().trim();
+        let match;
+        while ((match = linkRegex.exec(html)) !== null) {
+          let link = match[1];
+          let title = match[2].replace(/<[^>]*>/g, "").trim();
 
-          if (!href) return;
+          if (!link || !title) continue;
+          if (!link.startsWith("http")) continue;
 
-          // Resolve relative URL
-          let finalUrl = href.startsWith("http")
-            ? href
-            : new URL(href, src.url(query)).href;
+          // Apply strong matching
+          if (!strongMatch(title, q)) continue;
 
-          // Reject bad links
-          if (BAD_LINKS.some(b => finalUrl.includes(b))) return;
-
-          // Title must match keywords
-          const t = title.toLowerCase();
-          const match = keywords.some(k => t.includes(k));
-
-          if (!match) return;
-
-          out.push({
-            title: title.slice(0, 150),
-            url: finalUrl,
-            keywords: [src.cat, ...keywords]
+          results.push({
+            title,
+            url: link,
+            keywords: q.split(" ")
           });
-        });
+        }
 
-        return out.slice(0, 5);
-      } catch (e) {
-        return [];
+      } catch (err) {
+        console.log("Source failed:", url);
       }
     }
 
-    let results = [];
-    for (let s of SOURCES) {
-      const r = await scrape(s);
-      results.push(...r);
-    }
-
-    // REMOVE DUPLICATES
-    const seen = new Set();
-    results = results.filter(r => {
-      if (seen.has(r.url)) return false;
-      seen.add(r.url);
-      return true;
-    });
+    // Deduplicate by URL
+    results = results.filter(
+      (obj, index, self) => index === self.findIndex(o => o.url === obj.url)
+    );
 
     return res.status(200).json({
       query: q,
+      category,
       resultsCount: results.length,
       results
     });
 
-  } catch (err) {
+  } catch (error) {
     return res.status(500).json({
       error: "Search failed",
-      details: err.message
+      details: error.message
     });
   }
 }
