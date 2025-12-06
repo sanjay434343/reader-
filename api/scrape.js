@@ -24,6 +24,19 @@ function setCache(key, data, ttl) {
 // -----------------------------------------
 
 export default async function handler(req, res) {
+  // -----------------------------------------
+  // ENABLE CORS FOR ALL ORIGINS
+  // -----------------------------------------
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+
+  // Handle preflight OPTIONS request
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+  // -----------------------------------------
+
   try {
     const { url, ttl } = req.query;
     const cacheTTL = ttl ? parseInt(ttl) * 1000 : DEFAULT_TTL;
@@ -82,12 +95,10 @@ export default async function handler(req, res) {
       }
     }
 
-    // Fallback to body content
     if (content.trim().length < 100) {
       content = $("body").text();
     }
 
-    // Clean text
     content = content
       .replace(/\s+/g, " ")
       .replace(/function.*?\}/gs, "")
@@ -96,7 +107,7 @@ export default async function handler(req, res) {
       .trim();
 
     // -----------------------------
-    //  CONTENT IMAGES ONLY
+    // CONTENT IMAGES ONLY
     // -----------------------------
     const VALID_EXT = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
 
@@ -199,7 +210,7 @@ export default async function handler(req, res) {
     links = [...new Set(links)];
 
     // -----------------------------
-    // RESULT JSON
+    // FINAL RESPONSE
     // -----------------------------
     const result = {
       url,
