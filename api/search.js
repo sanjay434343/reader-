@@ -1,160 +1,136 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
 
-// --------------------
-// CHECK MATCH SCORE
-// --------------------
-function strongMatch(title, query) {
-  const t = title.toLowerCase();
-  const q = query.toLowerCase().split(" ").filter(w => w.length > 2);
+// --------------------------------------------
+// SEARCH TARGETS (real news portals with search)
+// --------------------------------------------
+const NEWS_SITES = [
+  { name: "Indian Express", url: q => `https://indianexpress.com/?s=${q}` },
+  { name: "Times of India", url: q => `https://timesofindia.indiatimes.com/topic/${q}` },
+  { name: "BBC", url: q => `https://www.bbc.co.uk/search?q=${q}` },
+  { name: "NDTV", url: q => `https://www.ndtv.com/search?searchtext=${q}` },
+  { name: "Hindustan Times", url: q => `https://www.hindustantimes.com/search?q=${q}` },
+  { name: "The Hindu", url: q => `https://www.thehindu.com/search/?q=${q}` },
 
+  // TECHNOLOGY
+  { name: "The Verge", url: q => `https://www.theverge.com/search?q=${q}` },
+  { name: "TechCrunch", url: q => `https://search.techcrunch.com/search?q=${q}` },
+
+  // SPORTS
+  { name: "ESPN", url: q => `https://www.espn.com/search/results?q=${q}` },
+
+  // SCIENCE
+  { name: "Live Science", url: q => `https://www.livescience.com/search?q=${q}` },
+
+  // BLOGS
+  { name: "Dev.to", url: q => `https://dev.to/search?q=${q}` }
+];
+
+// --------------------------------------------
+// CLEAN URL VALIDATION
+// --------------------------------------------
+function isValidArticle(url) {
+  if (!url) return false;
+
+  const bad = [
+    "facebook.com", "twitter.com", "x.com",
+    "pinterest.com", "instagram.com", "mailto:",
+    "/tag/", "/topic/",
+    "share", "subscribe", "login", "signup", "account"
+  ];
+
+  return !bad.some(b => url.includes(b));
+}
+
+// --------------------------------------------
+// RANK RESULTS (keyword match scoring)
+// --------------------------------------------
+function scoreResult(url, title, queryWords) {
+  const text = (title + " " + url).toLowerCase();
   let score = 0;
-  q.forEach(w => {
-    if (t.includes(w)) score++;
+
+  queryWords.forEach(word => {
+    if (text.includes(word)) score += 5;       // Strong match
+    if (title.toLowerCase().startsWith(word)) score += 10; // Title begins with keyword
   });
 
-  return score >= Math.ceil(q.length * 0.4);
+  return score;
 }
 
-// --------------------
-// SITE SCRAPERS
-// --------------------
-const SITE_RULES = {
-  "indianexpress": {
-    selector: "a",
-    getUrl: (el, $) => $(el).attr("href"),
-    getTitle: (el, $) => $(el).text().trim()
-  },
-  "timesofindia": {
-    selector: "a[href*='/articleshow']",
-    getUrl: (el, $) => $(el).attr("href"),
-    getTitle: (el, $) => $(el).text().trim()
-  },
-  "theverge": {
-    selector: "a[href*='/']",
-    getUrl: (el, $) => $(el).attr("href"),
-    getTitle: (el, $) => $(el).find("h2, h3").text().trim() || $(el).text().trim()
-  },
-  "economictimes": {
-    selector: "a[href*='articleshow']",
-    getUrl: (el, $) => $(el).attr("href"),
-    getTitle: (el, $) => $(el).text().trim()
-  },
-  "bbc": {
-    selector: "a[href*='/news/']",
-    getUrl: (el, $) => $(el).attr("href"),
-    getTitle: (el, $) => $(el).text().trim()
-  }
-};
-
-// --------------------
-// CATEGORY SOURCES
-// --------------------
-const SOURCES = {
-  tech: [
-    "https://timesofindia.indiatimes.com/technology",
-    "https://indianexpress.com/section/technology/",
-    "https://www.theverge.com/",
-    "https://economictimes.indiatimes.com/tech",
-    "https://www.bbc.com/news/technology"
-  ],
-  news: [
-    "https://indianexpress.com/",
-    "https://timesofindia.indiatimes.com/",
-    "https://www.bbc.com/news"
-  ]
-};
-
-// --------------------
-// GET DOMAIN KEY
-// --------------------
-function getDomainKey(url) {
-  if (url.includes("indianexpress")) return "indianexpress";
-  if (url.includes("indiatimes")) return "timesofindia";
-  if (url.includes("theverge")) return "theverge";
-  if (url.includes("economictimes")) return "economictimes";
-  if (url.includes("bbc")) return "bbc";
-  return "generic";
-}
-
-// --------------------
-// SCRAPE FUNCTION
-// --------------------
-async function scrapeSite(url, query) {
+// --------------------------------------------
+// SCRAPE ONE SEARCH PAGE
+// --------------------------------------------
+async function scrapeSite(site, query, queryWords) {
   try {
-    const html = await axios.get(url, {
-      headers: { "User-Agent": "Mozilla/5.0 Chrome/120 Safari/537.36" }
-    }).then(res => res.data);
+    const searchUrl = site.url(query);
+    const response = await axios.get(searchUrl, {
+      headers: { "User-Agent": "Mozilla/5.0 Chrome Safari" },
+      timeout: 8000
+    });
 
-    const $ = cheerio.load(html);
+    const $ = cheerio.load(response.data);
+    let results = [];
 
-    const rulesKey = getDomainKey(url);
-    const rules = SITE_RULES[rulesKey];
+    $("a").each((i, el) => {
+      let href = $(el).attr("href");
+      let title = $(el).text().trim();
 
-    if (!rules) return [];
+      if (!href) return;
+      if (!href.startsWith("http")) return;
+      if (!isValidArticle(href)) return;
+      if (title.length < 5) return;
 
-    let out = [];
-
-    $(rules.selector).each((i, el) => {
-      let link = rules.getUrl(el, $);
-      let title = rules.getTitle(el, $);
-
-      if (!link || !title) return;
-      if (!title || title.length < 5) return;
-
-      // Normalize link
-      if (link.startsWith("/")) {
-        const base = new URL(url).origin;
-        link = base + link;
-      }
-
-      // Must contain exact page, not homepage
-      if (!link.includes("article") && !link.includes("show") && !link.includes("/news/")) {
-        return;
-      }
-
-      // Strong match
-      if (!strongMatch(title, query)) return;
-
-      out.push({
+      results.push({
+        site: site.name,
         title,
-        url: link,
-        keywords: query.split(" ")
+        url: href,
+        score: scoreResult(href, title, queryWords)
       });
     });
 
-    return out;
+    return results;
 
   } catch (err) {
-    return [];
+    return []; // fail silently
   }
 }
 
-// --------------------
-// MAIN API
-// --------------------
+// --------------------------------------------
+// MAIN SEARCH HANDLER
+// --------------------------------------------
 export default async function handler(req, res) {
-  const { q } = req.query;
-  if (!q) return res.status(400).json({ error: "Query required" });
+  res.setHeader("Access-Control-Allow-Origin", "*");
 
-  const category = "tech"; // forced for your test
+  const query = req.query.q;
+  if (!query) return res.status(400).json({ error: "Query required" });
 
-  let finalResults = [];
+  const queryWords = query.toLowerCase().split(/\s+/);
 
-  for (let source of SOURCES[category]) {
-    const siteResults = await scrapeSite(source, q);
-    finalResults = finalResults.concat(siteResults);
-  }
-
-  // Deduplicate by URL
-  finalResults = finalResults.filter(
-    (v, i, a) => a.findIndex(t => t.url === v.url) === i
+  // PARALLEL SCRAPING
+  const promises = NEWS_SITES.map(
+    site => scrapeSite(site, query, queryWords)
   );
 
-  res.status(200).json({
-    query: q,
-    category,
-    resultsCount: finalResults.length,
-    results: finalResults
+  const allResults = (await Promise.all(promises)).flat();
+
+  // REMOVE duplicates by URL
+  const unique = [];
+  const seen = new Set();
+
+  allResults.forEach(r => {
+    if (!seen.has(r.url)) {
+      seen.add(r.url);
+      unique.push(r);
+    }
+  });
+
+  // SORT by score (descending)
+  unique.sort((a, b) => b.score - a.score);
+
+  // FINAL OUTPUT
+  return res.json({
+    query,
+    resultsCount: unique.length,
+    results: unique.slice(0, 50) // Top 50
   });
 }
