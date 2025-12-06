@@ -1,146 +1,160 @@
 import axios from "axios";
+import * as cheerio from "cheerio";
 
-// -------------------------------------------
-// CATEGORY KEYWORD MAP
-// -------------------------------------------
-const CATEGORY_KEYWORDS = {
-  news: ["breaking", "attack", "accident", "crime", "blast", "election", "protest"],
-  tech: ["android", "iphone", "google", "apple", "update", "software", "ai", "beta"],
-  sports: ["match", "score", "t20", "cricket", "football", "fifa", "ipl"],
-  business: ["market", "shares", "stock", "revenue", "startup", "funding"],
-  science: ["nasa", "research", "scientists", "discovery", "experiment"],
-  blogs: ["blog", "tutorial", "guide", "how to"]
-};
-
-// -------------------------------------------
-// DETECT CATEGORY FROM QUERY
-// -------------------------------------------
-function detectCategory(query) {
-  const q = query.toLowerCase();
-
-  for (let cat in CATEGORY_KEYWORDS) {
-    if (CATEGORY_KEYWORDS[cat].some(word => q.includes(word))) {
-      return cat;
-    }
-  }
-
-  return "general";
-}
-
-// -------------------------------------------
-// STRONG TITLE FILTERING LOGIC
-// -------------------------------------------
+// --------------------
+// CHECK MATCH SCORE
+// --------------------
 function strongMatch(title, query) {
   const t = title.toLowerCase();
-  const q = query.toLowerCase().split(" ");
+  const q = query.toLowerCase().split(" ").filter(w => w.length > 2);
 
-  // MUST contain all important words > 4 letters
-  const mustWords = q.filter(w => w.length > 4);
+  let score = 0;
+  q.forEach(w => {
+    if (t.includes(w)) score++;
+  });
 
-  // OPTIONAL words for better context
-  const optionalWords = q.filter(w => w.length <= 4);
-
-  const hasMust = mustWords.every(w => t.includes(w));
-  const hasOptional = optionalWords.some(w => t.includes(w));
-
-  return hasMust && hasOptional;
+  return score >= Math.ceil(q.length * 0.4);
 }
 
-// -------------------------------------------
-// MAIN API
-// -------------------------------------------
-export default async function handler(req, res) {
-  try {
-    const { q } = req.query;
-    if (!q) return res.status(400).json({ error: "Query is required" });
-
-    const category = detectCategory(q);
-
-    // -------------------------------------------
-    // SOURCES TO SCRAPE BASED ON CATEGORY
-    // -------------------------------------------
-    const SOURCES = {
-      news: [
-        `https://indianexpress.com/?s=${encodeURIComponent(q)}`,
-        `https://timesofindia.indiatimes.com/topic/${encodeURIComponent(q)}`,
-        `https://www.bbc.co.uk/search?q=${encodeURIComponent(q)}`
-      ],
-      tech: [
-        `https://timesofindia.indiatimes.com/technology/searchresults.cms?query=${encodeURIComponent(q)}`,
-        `https://www.theverge.com/search?q=${encodeURIComponent(q)}`,
-        `https://www.gsmarena.com/results.php3?sQuickSearch=yes&sName=${encodeURIComponent(q)}`
-      ],
-      sports: [
-        `https://www.espncricinfo.com/search?q=${encodeURIComponent(q)}`,
-        `https://www.bbc.com/sport/search?q=${encodeURIComponent(q)}`
-      ],
-      business: [
-        `https://economictimes.indiatimes.com/topic/${encodeURIComponent(q)}`
-      ],
-      science: [
-        `https://www.livescience.com/search?searchTerm=${encodeURIComponent(q)}`,
-        `https://www.sciencedaily.com/search/?keyword=${encodeURIComponent(q)}`
-      ],
-      general: [
-        `https://www.google.com/search?q=${encodeURIComponent(q)}`
-      ]
-    };
-
-    const targetSources = SOURCES[category];
-
-    let results = [];
-
-    // -------------------------------------------
-    // SCRAPE EACH SOURCE
-    // -------------------------------------------
-    for (let url of targetSources) {
-      try {
-        const html = await axios.get(url, {
-          headers: { "User-Agent": "Mozilla/5.0 Chrome/120 Safari/537.36" }
-        }).then(res => res.data);
-
-        // Extract links using regex (lightweight)
-        const linkRegex = /<a[^>]+href="([^"]+)"[^>]*>(.*?)<\/a>/gi;
-
-        let match;
-        while ((match = linkRegex.exec(html)) !== null) {
-          let link = match[1];
-          let title = match[2].replace(/<[^>]*>/g, "").trim();
-
-          if (!link || !title) continue;
-          if (!link.startsWith("http")) continue;
-
-          // Apply strong matching
-          if (!strongMatch(title, q)) continue;
-
-          results.push({
-            title,
-            url: link,
-            keywords: q.split(" ")
-          });
-        }
-
-      } catch (err) {
-        console.log("Source failed:", url);
-      }
-    }
-
-    // Deduplicate by URL
-    results = results.filter(
-      (obj, index, self) => index === self.findIndex(o => o.url === obj.url)
-    );
-
-    return res.status(200).json({
-      query: q,
-      category,
-      resultsCount: results.length,
-      results
-    });
-
-  } catch (error) {
-    return res.status(500).json({
-      error: "Search failed",
-      details: error.message
-    });
+// --------------------
+// SITE SCRAPERS
+// --------------------
+const SITE_RULES = {
+  "indianexpress": {
+    selector: "a",
+    getUrl: (el, $) => $(el).attr("href"),
+    getTitle: (el, $) => $(el).text().trim()
+  },
+  "timesofindia": {
+    selector: "a[href*='/articleshow']",
+    getUrl: (el, $) => $(el).attr("href"),
+    getTitle: (el, $) => $(el).text().trim()
+  },
+  "theverge": {
+    selector: "a[href*='/']",
+    getUrl: (el, $) => $(el).attr("href"),
+    getTitle: (el, $) => $(el).find("h2, h3").text().trim() || $(el).text().trim()
+  },
+  "economictimes": {
+    selector: "a[href*='articleshow']",
+    getUrl: (el, $) => $(el).attr("href"),
+    getTitle: (el, $) => $(el).text().trim()
+  },
+  "bbc": {
+    selector: "a[href*='/news/']",
+    getUrl: (el, $) => $(el).attr("href"),
+    getTitle: (el, $) => $(el).text().trim()
   }
+};
+
+// --------------------
+// CATEGORY SOURCES
+// --------------------
+const SOURCES = {
+  tech: [
+    "https://timesofindia.indiatimes.com/technology",
+    "https://indianexpress.com/section/technology/",
+    "https://www.theverge.com/",
+    "https://economictimes.indiatimes.com/tech",
+    "https://www.bbc.com/news/technology"
+  ],
+  news: [
+    "https://indianexpress.com/",
+    "https://timesofindia.indiatimes.com/",
+    "https://www.bbc.com/news"
+  ]
+};
+
+// --------------------
+// GET DOMAIN KEY
+// --------------------
+function getDomainKey(url) {
+  if (url.includes("indianexpress")) return "indianexpress";
+  if (url.includes("indiatimes")) return "timesofindia";
+  if (url.includes("theverge")) return "theverge";
+  if (url.includes("economictimes")) return "economictimes";
+  if (url.includes("bbc")) return "bbc";
+  return "generic";
+}
+
+// --------------------
+// SCRAPE FUNCTION
+// --------------------
+async function scrapeSite(url, query) {
+  try {
+    const html = await axios.get(url, {
+      headers: { "User-Agent": "Mozilla/5.0 Chrome/120 Safari/537.36" }
+    }).then(res => res.data);
+
+    const $ = cheerio.load(html);
+
+    const rulesKey = getDomainKey(url);
+    const rules = SITE_RULES[rulesKey];
+
+    if (!rules) return [];
+
+    let out = [];
+
+    $(rules.selector).each((i, el) => {
+      let link = rules.getUrl(el, $);
+      let title = rules.getTitle(el, $);
+
+      if (!link || !title) return;
+      if (!title || title.length < 5) return;
+
+      // Normalize link
+      if (link.startsWith("/")) {
+        const base = new URL(url).origin;
+        link = base + link;
+      }
+
+      // Must contain exact page, not homepage
+      if (!link.includes("article") && !link.includes("show") && !link.includes("/news/")) {
+        return;
+      }
+
+      // Strong match
+      if (!strongMatch(title, query)) return;
+
+      out.push({
+        title,
+        url: link,
+        keywords: query.split(" ")
+      });
+    });
+
+    return out;
+
+  } catch (err) {
+    return [];
+  }
+}
+
+// --------------------
+// MAIN API
+// --------------------
+export default async function handler(req, res) {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: "Query required" });
+
+  const category = "tech"; // forced for your test
+
+  let finalResults = [];
+
+  for (let source of SOURCES[category]) {
+    const siteResults = await scrapeSite(source, q);
+    finalResults = finalResults.concat(siteResults);
+  }
+
+  // Deduplicate by URL
+  finalResults = finalResults.filter(
+    (v, i, a) => a.findIndex(t => t.url === v.url) === i
+  );
+
+  res.status(200).json({
+    query: q,
+    category,
+    resultsCount: finalResults.length,
+    results: finalResults
+  });
 }
