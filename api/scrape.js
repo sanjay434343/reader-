@@ -22,9 +22,21 @@ function setCache(key, data, ttl) {
 }
 
 // -----------------------------------------
+// CHUNK TEXT INTO 4000 CHAR BLOCKS
+// -----------------------------------------
+function chunkText(text, maxSize = 4000) {
+  const chunks = [];
+  text = text.replace(/\s+/g, " ").trim();   // clean \n and extra spaces
+
+  for (let i = 0; i < text.length; i += maxSize) {
+    chunks.push(text.slice(i, i + maxSize));
+  }
+  return chunks;
+}
+
+// -----------------------------------------
 
 export default async function handler(req, res) {
-  // Enable CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "*");
@@ -41,7 +53,7 @@ export default async function handler(req, res) {
     const cached = getCache(cacheKey);
     if (cached) return res.status(200).json({ success: true, cached: true, ...cached });
 
-    // Fetch HTML
+    // Fetch page
     const response = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0 Chrome/120 Safari/537.36" }
     });
@@ -49,139 +61,122 @@ export default async function handler(req, res) {
     const html = response.data;
     const $ = cheerio.load(html);
 
-    // -----------------------------------------
-    // REMOVE JUNK ELEMENTS COMPLETELY
-    // -----------------------------------------
+    // Remove junk
     const REMOVE_SELECTORS = [
       "script","style","noscript","header","footer","nav",
       "iframe","form","button","svg","canvas",
       ".ads",".ad",".advertisement",".sponsored",".promo",
       ".share",".social",".cookie",".newsletter",
-      ".popup",".modal",".breadcrumb",".banner",
-      ".related","aside",".sidebar","section.widget",
-      "link[rel=stylesheet]"
+      ".popup",".modal",".breadcrumb",".banner"
     ];
     REMOVE_SELECTORS.forEach(sel => $(sel).remove());
 
-    // -----------------------------------------
-    // MAIN CONTENT EXTRACTION
-    // -----------------------------------------
+    // Extract main content
     const MAIN_SELECTORS = [
-      "article",
-      ".article",
-      ".post",
-      ".main-content",
-      ".content",
-      ".story",
-      "#content"
+      "article",".article",".post",".main-content",
+      ".story",".content","#content"
     ];
 
     let content = "";
     for (let sel of MAIN_SELECTORS) {
-      if ($(sel).text().trim().length > 150) {
+      if ($(sel).text().trim().length > 120) {
         content = $(sel).text();
         break;
       }
     }
+    if (content.length < 120) content = $("body").text();
 
-    // fallback
-    if (content.length < 150) content = $("body").text();
-
-    // TEXT CLEANING
+    // CLEAN text
     content = content
       .replace(/\s+/g, " ")
       .replace(/<!--.*?-->/gs, "")
       .replace(/function.*?\}/gs, "")
       .replace(/var .*?;/gs, "")
-      .replace(/ADVERTISEMENT/gi, "")
       .trim();
 
+    // REMOVE noise phrases
+    const REMOVE_PHRASES = [
+      "ADVERTISEMENT","ADVERTISEMENT CONTINUE READING",
+      "30 SEC READ","READ |","CLICK HERE","SUBSCRIBE NOW",
+      "SCROLL TO CONTINUE","TRENDING","LIVE UPDATES",
+      "Premium Story","You May Like"
+    ];
+    REMOVE_PHRASES.forEach(p => {
+      const regex = new RegExp(p, "gi");
+      content = content.replace(regex, "");
+    });
+
     // REMOVE DUPLICATE SENTENCES
-    const cleanSentences = [...new Set(content.split(/[.!?]+/).map(s => s.trim()))];
-    content = cleanSentences.join(". ").trim();
+    let sentences = content.split(/[.!?]+/).map(s => s.trim());
+    let uniqueSentences = [...new Set(sentences)];
+    content = uniqueSentences.join(". ").trim();
 
     // -----------------------------------------
-    // IMAGE FILTERING — ONLY REAL ARTICLE IMAGES
+    // NEW: SPLIT INTO 4000 CHAR CHUNKS
     // -----------------------------------------
-    const VALID_EXT = [".jpg",".jpeg",".png",".webp"];
-    const BAD_PATTERNS = [
-      "logo","icon","sprite","default","placeholder",
-      "ads","advert","banner","pixel","tracking","share",
-      "social","thumb","small","mini","favicon","og-image"
-    ];
+    const chunks = chunkText(content, 4000);
+
+    // -----------------------------------------
+    // IMAGES
+    // -----------------------------------------
+    const VALID_EXT = [".jpg",".jpeg",".png",".webp",".gif"];
+    const BAD_PATTERNS = ["logo","icon","sprite","default","ads","pixel","banner"];
 
     const IMAGE_SELECTORS = [
-      "article img",
-      ".article img",
-      ".post img",
-      ".story img",
-      ".content img",
-      ".main-content img",
-      "img[loading='lazy']"
+      "article img",".article img",".post img",".story img",
+      ".content img",".main-content img","img.size-large"
     ];
 
-    let images = [];
+    let rawImages = [];
 
-    function isGoodImage(src) {
+    function isValidImage(src) {
       if (!src) return false;
       const lower = src.toLowerCase();
-      if (!VALID_EXT.some(ext => lower.includes(ext))) return false;
-      if (BAD_PATTERNS.some(bad => lower.includes(bad))) return false;
-      if (lower.includes("logo")) return false;
-      if (lower.includes("icon")) return false;
-      if (lower.length < 15) return false;
+      if (!VALID_EXT.some(e => lower.includes(e))) return false;
+      if (BAD_PATTERNS.some(b => lower.includes(b))) return false;
       return true;
     }
 
     IMAGE_SELECTORS.forEach(sel => {
       $(sel).each((i, el) => {
-        let src = $(el).attr("src") || $(el).attr("data-src") || "";
-        if (isGoodImage(src)) {
-          try {
-            images.push(new URL(src, url).href);
-          } catch {}
+        let src = $(el).attr("src") || $(el).attr("data-src");
+        if (isValidImage(src)) {
+          try { rawImages.push(new URL(src, url).href); } catch {}
         }
       });
     });
 
-    images = [...new Set(images)];
+    const images = [...new Set(rawImages)];
 
     // -----------------------------------------
-    // VIDEO FILTERING
+    // VIDEOS
     // -----------------------------------------
     const VIDEO_SELECTORS = [
-      "article iframe",
-      ".post iframe",
-      ".story iframe",
-      ".content iframe",
-      "article video",
-      ".content video"
+      "article iframe",".content iframe",".post iframe",".story iframe",
+      ".content video","article video"
     ];
 
-    let videos = [];
-
+    let rawVideos = [];
     VIDEO_SELECTORS.forEach(sel => {
       $(sel).each((i, el) => {
-        let src = $(el).attr("src") || $(el).attr("data-src");
+        let src = $(el).attr("src");
         if (src && src.startsWith("http")) {
-          try {
-            videos.push(new URL(src, url).href);
-          } catch {}
+          try { rawVideos.push(new URL(src, url).href); } catch {}
         }
       });
     });
 
-    videos = [...new Set(videos)];
+    const videos = [...new Set(rawVideos)];
 
     // -----------------------------------------
-    // LINKS – Deduped & Clean
+    // LINKS CLEANED
     // -----------------------------------------
     const BAD_LINKS = ["facebook.com","twitter.com","x.com","instagram.com","whatsapp.com","share="];
 
-    let links = $("a")
-      .map((i, el) => $(el).attr("href"))
-      .get()
-      .filter(Boolean)
+    let rawLinks = $("a").map((i, el) => $(el).attr("href")).get();
+
+    let links = rawLinks
+      .filter(h => h)
       .map(h => { try { return new URL(h, url).href; } catch { return null; }})
       .filter(h => h && !BAD_LINKS.some(b => h.includes(b)));
 
@@ -193,12 +188,14 @@ export default async function handler(req, res) {
     const result = {
       url,
       title: $("title").text().trim(),
-      content,
+      chunks,        // <-- chunked text for pollinations
+      content,       // cleaned full content
       images,
       videos,
       links,
       length: {
-        text: content.length,
+        textLength: content.length,
+        chunks: chunks.length,
         images: images.length,
         videos: videos.length,
         links: links.length
@@ -207,11 +204,7 @@ export default async function handler(req, res) {
 
     setCache(cacheKey, result, cacheTTL);
 
-    return res.status(200).json({
-      success: true,
-      cached: false,
-      ...result
-    });
+    return res.status(200).json({ success: true, cached: false, ...result });
 
   } catch (err) {
     return res.status(500).json({
