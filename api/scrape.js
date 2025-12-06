@@ -104,7 +104,7 @@ class FullContentExtractor {
     
     // Remove all unwanted elements first
     const REMOVE_SELECTORS = [
-      "script", "style", "noscript", "iframe", "canvas", "svg",
+      "script", "style", "noscript", "canvas", "svg",
       "header", "footer", "nav", "aside",
       "form", "button", "input", "select", "textarea",
       ".ads", ".ad", ".advertisement", ".sponsored", ".promo",
@@ -112,84 +112,87 @@ class FullContentExtractor {
       ".cookie", ".newsletter", ".popup", ".modal",
       ".breadcrumb", ".banner", ".sidebar", ".widget",
       ".comments", ".comment-section", ".related-posts",
+      ".related-articles", ".recommended", ".more-from",
       "[class*='sidebar']", "[id*='sidebar']",
       "[class*='footer']", "[id*='footer']",
       "[class*='header']", "[id*='header']",
       "[class*='nav']", "[id*='nav']",
       "[class*='menu']", "[id*='menu']",
-      "[class*='ads']", "[id*='ads']"
+      "[class*='ads']", "[id*='ads']",
+      "[class*='author-bio']", "[class*='author_bio']",
+      "[id*='author']", ".author-card", ".byline-info"
     ];
     
     REMOVE_SELECTORS.forEach(sel => $(sel).remove());
 
-    // Extract ALL paragraph text
+    // Site-specific selectors (Times of India, etc.)
+    const PRIORITY_SELECTORS = [
+      // Times of India specific
+      ".article_content", ".artText", ".Normal", 
+      "div[data-articlebody]", ".story-content",
+      // BBC
+      "[data-component='text-block']", ".ssrcss-1q0x1qg-Paragraph",
+      // The Hindu
+      ".articlebodycontent", ".article-content",
+      // NDTV
+      ".sp-cn", ".story__content",
+      // Generic
+      "article", "main", "[role='main']",
+      ".article-body", ".post-content", ".entry-content",
+      ".story-body", ".content-body", ".article_body"
+    ];
+
+    // Try priority selectors first
+    for (const selector of PRIORITY_SELECTORS) {
+      const element = $(selector);
+      if (element.length > 0) {
+        const text = element.text().trim();
+        if (text.length > 300) {
+          return text;
+        }
+      }
+    }
+
+    // Fallback: Extract ALL paragraphs
     let allParagraphs = [];
     $("p").each((i, el) => {
       const text = $(el).text().trim();
-      if (text.length > 20) {  // Filter out very short paragraphs
+      // Filter out very short paragraphs and author bios
+      if (text.length > 25 && 
+          !text.toLowerCase().includes("toi tech desk") &&
+          !text.toLowerCase().includes("journalist") &&
+          !text.toLowerCase().includes("author bio")) {
         allParagraphs.push(text);
       }
     });
 
-    // Extract ALL div text (fallback for non-semantic HTML)
-    let allDivText = [];
+    if (allParagraphs.length > 0) {
+      return allParagraphs.join(" ");
+    }
+
+    // Fallback: Extract from divs with substantial text
+    let contentDivs = [];
     $("div").each((i, el) => {
       const $el = $(el);
-      // Get direct text only (not from child elements)
-      const text = $el.contents()
-        .filter(function() {
-          return this.type === 'text';
-        })
-        .text()
-        .trim();
+      const paragraphs = $el.find("p");
       
-      if (text.length > 30) {
-        allDivText.push(text);
+      // If div contains multiple paragraphs, it's likely content
+      if (paragraphs.length >= 3) {
+        const text = $el.text().trim();
+        if (text.length > 500) {
+          contentDivs.push(text);
+        }
       }
     });
 
-    // Extract article/main content areas
-    let mainContent = [];
-    const MAIN_SELECTORS = [
-      "article", "main", "[role='main']", 
-      ".article", ".post", ".story", ".content",
-      ".article-body", ".post-content", ".entry-content",
-      "#article", "#content", "#main-content"
-    ];
-
-    MAIN_SELECTORS.forEach(sel => {
-      $(sel).each((i, el) => {
-        const text = $(el).text().trim();
-        if (text.length > 100) {
-          mainContent.push(text);
-        }
-      });
-    });
-
-    // Strategy: Try different extraction methods
-    let fullText = "";
-
-    // 1. Try article/main content first (highest quality)
-    if (mainContent.length > 0) {
-      fullText = mainContent.join(" ");
-    }
-    
-    // 2. If not enough, use all paragraphs
-    if (fullText.length < 500 && allParagraphs.length > 0) {
-      fullText = allParagraphs.join(" ");
+    if (contentDivs.length > 0) {
+      // Get the longest one (likely the main article)
+      contentDivs.sort((a, b) => b.length - a.length);
+      return contentDivs[0];
     }
 
-    // 3. If still not enough, combine everything
-    if (fullText.length < 500) {
-      fullText = [...mainContent, ...allParagraphs, ...allDivText].join(" ");
-    }
-
-    // 4. Last resort: get all body text
-    if (fullText.length < 200) {
-      fullText = $("body").text();
-    }
-
-    return fullText;
+    // Last resort: get all body text
+    return $("body").text().trim();
   }
 
   extractMetadata() {
