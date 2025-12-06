@@ -3,7 +3,7 @@ import * as cheerio from "cheerio";
 import { createHash } from "crypto";
 
 // =============================================================================
-// ARCHITECTURE: Multi-layer caching with LRU eviction
+// LRU CACHE
 // =============================================================================
 
 class LRUCache {
@@ -16,34 +16,22 @@ class LRUCache {
     if (!this.cache.has(key)) return null;
     const entry = this.cache.get(key);
     
-    // Check TTL expiration
     if (Date.now() - entry.timestamp > entry.ttl) {
       this.cache.delete(key);
       return null;
     }
     
-    // Move to end (most recently used)
     this.cache.delete(key);
     this.cache.set(key, entry);
     return entry.data;
   }
 
   set(key, data, ttl) {
-    // Evict oldest if at capacity
     if (this.cache.size >= this.maxSize) {
       const firstKey = this.cache.keys().next().value;
       this.cache.delete(firstKey);
     }
-    
     this.cache.set(key, { data, ttl, timestamp: Date.now() });
-  }
-
-  clear() {
-    this.cache.clear();
-  }
-
-  size() {
-    return this.cache.size;
   }
 }
 
@@ -51,7 +39,7 @@ const CACHE = new LRUCache(100);
 const DEFAULT_TTL = 600 * 1000;
 
 // =============================================================================
-// UTILITY: Content fingerprinting for deduplication
+// CONTENT HASH
 // =============================================================================
 
 function generateContentHash(text) {
@@ -59,7 +47,7 @@ function generateContentHash(text) {
 }
 
 // =============================================================================
-// CHUNKING: Smart text segmentation with sentence boundary preservation
+// SMART CHUNKING: 4000 characters with sentence boundaries
 // =============================================================================
 
 function chunkText(text, maxSize = 4000) {
@@ -70,26 +58,22 @@ function chunkText(text, maxSize = 4000) {
     return [text];
   }
 
-  // Split by sentence boundaries for better context preservation
   const sentences = text.split(/(?<=[.!?])\s+/);
   let currentChunk = "";
   
   for (const sentence of sentences) {
-    // If single sentence exceeds maxSize, force split
     if (sentence.length > maxSize) {
       if (currentChunk) {
         chunks.push(currentChunk.trim());
         currentChunk = "";
       }
       
-      // Hard split long sentence
       for (let i = 0; i < sentence.length; i += maxSize) {
         chunks.push(sentence.slice(i, i + maxSize));
       }
       continue;
     }
     
-    // Add sentence if it fits
     if ((currentChunk + " " + sentence).length <= maxSize) {
       currentChunk += (currentChunk ? " " : "") + sentence;
     } else {
@@ -106,83 +90,108 @@ function chunkText(text, maxSize = 4000) {
 }
 
 // =============================================================================
-// EXTRACTION: Advanced content extraction with fallback strategies
+// AGGRESSIVE CONTENT EXTRACTION: Get ALL text from page
 // =============================================================================
 
-class ContentExtractor {
+class FullContentExtractor {
   constructor($, url) {
     this.$ = $;
     this.url = url;
   }
 
-  // Strategy pattern for content extraction
-  extractContent() {
-    const strategies = [
-      () => this.extractBySemanticHTML(),
-      () => this.extractByCommonClasses(),
-      () => this.extractByContentDensity(),
-      () => this.extractFallback()
-    ];
-
-    for (const strategy of strategies) {
-      const content = strategy();
-      if (content && content.length > 200) {
-        return content;
-      }
-    }
-
-    return this.extractFallback();
-  }
-
-  extractBySemanticHTML() {
-    const selectors = ["article", "main[role='main']", "[role='article']"];
+  extractAllContent() {
+    const $ = this.$;
     
-    for (const sel of selectors) {
-      const text = this.$(sel).text().trim();
-      if (text.length > 200) return text;
-    }
-    return null;
-  }
-
-  extractByCommonClasses() {
-    const selectors = [
-      ".article-content", ".post-content", ".entry-content",
-      ".story-body", ".article-body", "#article-body",
-      ".main-content", ".content-body"
+    // Remove all unwanted elements first
+    const REMOVE_SELECTORS = [
+      "script", "style", "noscript", "iframe", "canvas", "svg",
+      "header", "footer", "nav", "aside",
+      "form", "button", "input", "select", "textarea",
+      ".ads", ".ad", ".advertisement", ".sponsored", ".promo",
+      ".share", ".social", ".social-share", ".share-buttons",
+      ".cookie", ".newsletter", ".popup", ".modal",
+      ".breadcrumb", ".banner", ".sidebar", ".widget",
+      ".comments", ".comment-section", ".related-posts",
+      "[class*='sidebar']", "[id*='sidebar']",
+      "[class*='footer']", "[id*='footer']",
+      "[class*='header']", "[id*='header']",
+      "[class*='nav']", "[id*='nav']",
+      "[class*='menu']", "[id*='menu']",
+      "[class*='ads']", "[id*='ads']"
     ];
+    
+    REMOVE_SELECTORS.forEach(sel => $(sel).remove());
 
-    for (const sel of selectors) {
-      const text = this.$(sel).text().trim();
-      if (text.length > 200) return text;
-    }
-    return null;
-  }
-
-  extractByContentDensity() {
-    // Find paragraph-dense sections
-    let maxDensity = 0;
-    let bestContent = "";
-
-    this.$("div, section").each((i, el) => {
-      const $el = this.$(el);
-      const pCount = $el.find("p").length;
-      const text = $el.text().trim();
-      const density = pCount / (text.length / 1000 || 1);
-
-      if (density > maxDensity && text.length > 200) {
-        maxDensity = density;
-        bestContent = text;
+    // Extract ALL paragraph text
+    let allParagraphs = [];
+    $("p").each((i, el) => {
+      const text = $(el).text().trim();
+      if (text.length > 20) {  // Filter out very short paragraphs
+        allParagraphs.push(text);
       }
     });
 
-    return bestContent;
+    // Extract ALL div text (fallback for non-semantic HTML)
+    let allDivText = [];
+    $("div").each((i, el) => {
+      const $el = $(el);
+      // Get direct text only (not from child elements)
+      const text = $el.contents()
+        .filter(function() {
+          return this.type === 'text';
+        })
+        .text()
+        .trim();
+      
+      if (text.length > 30) {
+        allDivText.push(text);
+      }
+    });
+
+    // Extract article/main content areas
+    let mainContent = [];
+    const MAIN_SELECTORS = [
+      "article", "main", "[role='main']", 
+      ".article", ".post", ".story", ".content",
+      ".article-body", ".post-content", ".entry-content",
+      "#article", "#content", "#main-content"
+    ];
+
+    MAIN_SELECTORS.forEach(sel => {
+      $(sel).each((i, el) => {
+        const text = $(el).text().trim();
+        if (text.length > 100) {
+          mainContent.push(text);
+        }
+      });
+    });
+
+    // Strategy: Try different extraction methods
+    let fullText = "";
+
+    // 1. Try article/main content first (highest quality)
+    if (mainContent.length > 0) {
+      fullText = mainContent.join(" ");
+    }
+    
+    // 2. If not enough, use all paragraphs
+    if (fullText.length < 500 && allParagraphs.length > 0) {
+      fullText = allParagraphs.join(" ");
+    }
+
+    // 3. If still not enough, combine everything
+    if (fullText.length < 500) {
+      fullText = [...mainContent, ...allParagraphs, ...allDivText].join(" ");
+    }
+
+    // 4. Last resort: get all body text
+    if (fullText.length < 200) {
+      fullText = $("body").text();
+    }
+
+    return fullText;
   }
 
-  extractFallback() {
-    return this.$("body").text().trim();
-  }
-
-  // Extract metadata with OpenGraph fallbacks
   extractMetadata() {
     const $ = this.$;
     
@@ -202,7 +211,169 @@ class ContentExtractor {
 }
 
 // =============================================================================
-// MEDIA EXTRACTION: Robust image and video detection
+// AGGRESSIVE TEXT CLEANING PIPELINE
+// =============================================================================
+
+class AggressiveTextCleaner {
+  constructor(text) {
+    this.text = text;
+  }
+
+  clean() {
+    return this
+      .normalizeWhitespace()
+      .removeComments()
+      .removeScriptFragments()
+      .removeAdvertisements()
+      .removeBoilerplate()
+      .removeSocialMedia()
+      .removeNavigation()
+      .removeDuplicateSentences()
+      .removeExcessiveNewlines()
+      .getText();
+  }
+
+  normalizeWhitespace() {
+    this.text = this.text
+      .replace(/\s+/g, " ")
+      .replace(/\t/g, " ")
+      .trim();
+    return this;
+  }
+
+  removeComments() {
+    this.text = this.text.replace(/<!--.*?-->/gs, "");
+    return this;
+  }
+
+  removeScriptFragments() {
+    const patterns = [
+      /function\s*\(.*?\)\s*\{.*?\}/gs,
+      /var\s+\w+\s*=.*?;/gs,
+      /const\s+\w+\s*=.*?;/gs,
+      /let\s+\w+\s*=.*?;/gs,
+      /window\.\w+/g,
+      /document\.\w+/g,
+      /\{.*?:\s*function.*?\}/gs
+    ];
+
+    patterns.forEach(p => {
+      this.text = this.text.replace(p, "");
+    });
+
+    return this;
+  }
+
+  removeAdvertisements() {
+    const patterns = [
+      /ADVERTISEMENT(\s+CONTINUE READING)?/gi,
+      /\d+\s+SEC\s+READ/gi,
+      /READ\s*\|/gi,
+      /CLICK\s+HERE/gi,
+      /SUBSCRIBE\s+NOW/gi,
+      /SCROLL\s+TO\s+CONTINUE/gi,
+      /TRENDING\s*:?/gi,
+      /LIVE\s+UPDATES/gi,
+      /Premium\s+Story/gi,
+      /You\s+May\s+Like/gi,
+      /RELATED\s+ARTICLES?/gi,
+      /MORE\s+FROM/gi,
+      /Recommended\s+for\s+you/gi,
+      /Most\s+Popular/gi,
+      /Editor'?s?\s+Pick/gi
+    ];
+
+    patterns.forEach(p => {
+      this.text = this.text.replace(p, "");
+    });
+
+    return this;
+  }
+
+  removeBoilerplate() {
+    const boilerplate = [
+      /Share\s+this\s+article/gi,
+      /Follow\s+us\s+on/gi,
+      /Subscribe\s+to\s+our\s+newsletter/gi,
+      /Sign\s+up\s+for/gi,
+      /By\s+clicking/gi,
+      /Terms\s+of\s+Service/gi,
+      /Privacy\s+Policy/gi,
+      /Cookie\s+Policy/gi,
+      /All\s+rights\s+reserved/gi,
+      /Copyright\s+©/gi,
+      /Read\s+more:?/gi,
+      /Continue\s+reading/gi,
+      /View\s+all/gi,
+      /See\s+also/gi
+    ];
+
+    boilerplate.forEach(p => {
+      this.text = this.text.replace(p, "");
+    });
+
+    return this;
+  }
+
+  removeSocialMedia() {
+    const social = [
+      /Share\s+on\s+(Facebook|Twitter|LinkedIn|Instagram|WhatsApp)/gi,
+      /Tweet\s+this/gi,
+      /Pin\s+it/gi,
+      /Share\s+via\s+Email/gi,
+      /Follow\s+@\w+/gi
+    ];
+
+    social.forEach(p => {
+      this.text = this.text.replace(p, "");
+    });
+
+    return this;
+  }
+
+  removeNavigation() {
+    const nav = [
+      /Home\s*>\s*News/gi,
+      /Home\s*\/\s*News/gi,
+      /Breadcrumb/gi,
+      /Skip\s+to\s+(main\s+)?content/gi,
+      /Table\s+of\s+Contents/gi,
+      /In\s+this\s+article/gi
+    ];
+
+    nav.forEach(p => {
+      this.text = this.text.replace(p, "");
+    });
+
+    return this;
+  }
+
+  removeDuplicateSentences() {
+    const sentences = this.text
+      .split(/[.!?]+/)
+      .map(s => s.trim())
+      .filter(s => s.length > 10);  // Keep only substantial sentences
+    
+    const unique = [...new Set(sentences)];
+    this.text = unique.join(". ");
+    
+    return this;
+  }
+
+  removeExcessiveNewlines() {
+    this.text = this.text
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    return this;
+  }
+
+  getText() {
+    return this.text.trim();
+  }
+}
+
+// =============================================================================
+// MEDIA EXTRACTION
 // =============================================================================
 
 class MediaExtractor {
@@ -212,7 +383,7 @@ class MediaExtractor {
   }
 
   extractImages() {
-    const VALID_EXT = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg"];
+    const VALID_EXT = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
     const BAD_PATTERNS = ["logo", "icon", "sprite", "default", "ads", "pixel", "banner", "tracking"];
     const seen = new Set();
     const images = [];
@@ -228,13 +399,9 @@ class MediaExtractor {
 
       const lower = src.toLowerCase();
       
-      // Validate extension
       if (!VALID_EXT.some(e => lower.includes(e))) return;
-      
-      // Filter bad patterns
       if (BAD_PATTERNS.some(b => lower.includes(b))) return;
 
-      // Size heuristics
       const width = parseInt($el.attr("width")) || 0;
       const height = parseInt($el.attr("height")) || 0;
       if ((width > 0 && width < 100) || (height > 0 && height < 100)) return;
@@ -260,7 +427,6 @@ class MediaExtractor {
     const seen = new Set();
     const videos = [];
 
-    // iframe embeds (YouTube, Vimeo, etc.)
     this.$("iframe").each((i, el) => {
       const src = this.$(el).attr("src");
       if (src && src.startsWith("http")) {
@@ -278,7 +444,6 @@ class MediaExtractor {
       }
     });
 
-    // Native video elements
     this.$("video").each((i, el) => {
       const src = this.$(el).attr("src") || this.$(el).find("source").attr("src");
       if (src) {
@@ -305,103 +470,7 @@ class MediaExtractor {
 }
 
 // =============================================================================
-// TEXT CLEANING: Advanced noise removal pipeline
-// =============================================================================
-
-class TextCleaner {
-  constructor(text) {
-    this.text = text;
-  }
-
-  clean() {
-    return this
-      .normalizeWhitespace()
-      .removeComments()
-      .removeScriptFragments()
-      .removeAdvertisements()
-      .removeDuplicateSentences()
-      .removeBoilerplate()
-      .getText();
-  }
-
-  normalizeWhitespace() {
-    this.text = this.text
-      .replace(/\s+/g, " ")
-      .replace(/\n\s*\n/g, "\n")
-      .trim();
-    return this;
-  }
-
-  removeComments() {
-    this.text = this.text.replace(/<!--.*?-->/gs, "");
-    return this;
-  }
-
-  removeScriptFragments() {
-    this.text = this.text
-      .replace(/function.*?\}/gs, "")
-      .replace(/var\s+.*?;/gs, "")
-      .replace(/const\s+.*?;/gs, "")
-      .replace(/let\s+.*?;/gs, "");
-    return this;
-  }
-
-  removeAdvertisements() {
-    const patterns = [
-      /ADVERTISEMENT(\s+CONTINUE READING)?/gi,
-      /\d+\s+SEC\s+READ/gi,
-      /READ\s*\|/gi,
-      /CLICK\s+HERE/gi,
-      /SUBSCRIBE\s+NOW/gi,
-      /SCROLL\s+TO\s+CONTINUE/gi,
-      /TRENDING/gi,
-      /LIVE\s+UPDATES/gi,
-      /Premium\s+Story/gi,
-      /You\s+May\s+Like/gi,
-      /RELATED\s+ARTICLES?/gi,
-      /MORE\s+FROM/gi
-    ];
-
-    patterns.forEach(p => {
-      this.text = this.text.replace(p, "");
-    });
-
-    return this;
-  }
-
-  removeDuplicateSentences() {
-    const sentences = this.text.split(/[.!?]+/).map(s => s.trim()).filter(Boolean);
-    const unique = [...new Set(sentences)];
-    this.text = unique.join(". ");
-    return this;
-  }
-
-  removeBoilerplate() {
-    // Remove common boilerplate phrases
-    const boilerplate = [
-      /Share this article/gi,
-      /Follow us on/gi,
-      /Subscribe to our newsletter/gi,
-      /Sign up for/gi,
-      /By clicking/gi,
-      /Terms of Service/gi,
-      /Privacy Policy/gi
-    ];
-
-    boilerplate.forEach(p => {
-      this.text = this.text.replace(p, "");
-    });
-
-    return this;
-  }
-
-  getText() {
-    return this.text.trim();
-  }
-}
-
-// =============================================================================
-// ERROR HANDLING: Circuit breaker pattern for resilient scraping
+// CIRCUIT BREAKER
 // =============================================================================
 
 class CircuitBreaker {
@@ -409,7 +478,7 @@ class CircuitBreaker {
     this.failureCount = 0;
     this.threshold = threshold;
     this.timeout = timeout;
-    this.state = "CLOSED"; // CLOSED, OPEN, HALF_OPEN
+    this.state = "CLOSED";
     this.nextAttempt = Date.now();
   }
 
@@ -448,11 +517,10 @@ class CircuitBreaker {
 const breaker = new CircuitBreaker();
 
 // =============================================================================
-// MAIN HANDLER: Clean architecture with dependency injection
+// MAIN HANDLER
 // =============================================================================
 
 export default async function handler(req, res) {
-  // CORS headers
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "*");
@@ -462,7 +530,6 @@ export default async function handler(req, res) {
   const startTime = Date.now();
 
   try {
-    // Input validation
     const { url, ttl, format = "json" } = req.query;
     const cacheTTL = ttl ? parseInt(ttl) * 1000 : DEFAULT_TTL;
 
@@ -484,7 +551,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Invalid URL format" });
     }
 
-    // Cache lookup with content hash
+    // Cache check
     const cacheKey = `scrape:${generateContentHash(url)}`;
     const cached = CACHE.get(cacheKey);
     
@@ -498,7 +565,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // Fetch with circuit breaker protection
+    // Fetch page with circuit breaker
     const response = await breaker.execute(async () => {
       return await axios.get(url, {
         headers: { 
@@ -512,28 +579,16 @@ export default async function handler(req, res) {
     const html = response.data;
     const $ = cheerio.load(html);
 
-    // Remove noise elements
-    const REMOVE_SELECTORS = [
-      "script", "style", "noscript", "header", "footer", "nav",
-      "iframe[src*='ads']", "form", "button", "svg", "canvas",
-      ".ads", ".ad", ".advertisement", ".sponsored", ".promo",
-      ".share", ".social", ".cookie", ".newsletter",
-      ".popup", ".modal", ".breadcrumb", ".banner",
-      "[class*='sidebar']", "[id*='sidebar']"
-    ];
-    
-    REMOVE_SELECTORS.forEach(sel => $(sel).remove());
-
-    // Extract content using strategy pattern
-    const extractor = new ContentExtractor($, url);
-    const rawContent = extractor.extractContent();
+    // Extract ALL content
+    const extractor = new FullContentExtractor($, url);
+    const rawContent = extractor.extractAllContent();
     const metadata = extractor.extractMetadata();
 
-    // Clean content
-    const cleaner = new TextCleaner(rawContent);
+    // Aggressive cleaning
+    const cleaner = new AggressiveTextCleaner(rawContent);
     const cleanedContent = cleaner.clean();
 
-    // Chunk content intelligently
+    // Chunk into 4000 character pieces
     const chunks = chunkText(cleanedContent, 4000);
 
     // Extract media
@@ -546,6 +601,7 @@ export default async function handler(req, res) {
       url,
       metadata,
       chunks,
+      fullText: cleanedContent, // Include full cleaned text
       images,
       videos,
       statistics: {
@@ -553,17 +609,18 @@ export default async function handler(req, res) {
         images: images.length,
         videos: videos.length,
         totalChars: cleanedContent.length,
+        totalWords: cleanedContent.split(/\s+/).length,
         processingTime: Date.now() - startTime
       }
     };
 
-    // Cache the result
+    // Cache result
     CACHE.set(cacheKey, result, cacheTTL);
 
     // Format response
     if (format === "text") {
       res.setHeader("Content-Type", "text/plain");
-      return res.status(200).send(chunks.join("\n\n"));
+      return res.status(200).send(cleanedContent);
     }
 
     return res.status(200).json({ 
