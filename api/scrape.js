@@ -541,21 +541,6 @@ export default async function handler(req, res) {
     const images = mediaExtractor.extractImages();
     const videos = mediaExtractor.extractVideos();
 
-    // Extract links (avoid social media)
-    const BAD_LINKS = ["facebook.com", "twitter.com", "x.com", "instagram.com", "whatsapp.com", "share="];
-    
-    let links = $("a")
-      .map((i, el) => $(el).attr("href"))
-      .get()
-      .filter(Boolean)
-      .map(h => {
-        try { return new URL(h, url).href; } 
-        catch { return null; }
-      })
-      .filter(h => h && !BAD_LINKS.some(b => h.includes(b)));
-
-    links = [...new Set(links)];
-
     // Build response
     const result = {
       url,
@@ -563,12 +548,10 @@ export default async function handler(req, res) {
       chunks,
       images,
       videos,
-      links: links.slice(0, 50), // Limit to top 50
       statistics: {
         chunks: chunks.length,
         images: images.length,
         videos: videos.length,
-        links: links.length,
         totalChars: cleanedContent.length,
         processingTime: Date.now() - startTime
       }
