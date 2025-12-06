@@ -1,6 +1,5 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
-import { SummarizerManager } from "node-summarizer";
 
 // -----------------------------------------
 // GLOBAL CACHE
@@ -20,6 +19,59 @@ function getCache(key) {
 
 function setCache(key, data, ttl) {
   CACHE[key] = { data, ttl, timestamp: Date.now() };
+}
+
+// -----------------------------------------
+// CLEAN + COMPRESS SUMMARIZER
+// -----------------------------------------
+function cleanAndSummarize(text, maxSentences = 5) {
+  if (!text || text.length < 50) return text;
+
+  // Remove junk phrases
+  const JUNK = [
+    "skip to content", "premium", "ADVERTISEMENT",
+    "trending", "click here", "subscribe now",
+    "live updates", "share", "comments", "print",
+    "you may like", "continue reading"
+  ];
+
+  JUNK.forEach(j => {
+    const reg = new RegExp(j, "gi");
+    text = text.replace(reg, "");
+  });
+
+  // Convert into cleaned sentences
+  let sentences = text
+    .split(/(?<=[.?!])\s+/)
+    .map(s => s.trim())
+    .filter(s => s.length > 25); // remove tiny useless lines
+
+  // Remove duplicate sentences
+  let unique = [...new Set(sentences)];
+
+  if (unique.length <= maxSentences) return unique.join(" ");
+
+  // Word frequency scoring
+  const freq = {};
+  unique.join(" ").toLowerCase().split(/\W+/).forEach(word => {
+    if (word.length > 3) freq[word] = (freq[word] || 0) + 1;
+  });
+
+  function scoreSentence(sentence) {
+    return sentence
+      .toLowerCase()
+      .split(/\W+/)
+      .reduce((acc, w) => acc + (freq[w] || 0), 0);
+  }
+
+  // Rank and take top sentences
+  let ranked = unique
+    .map(s => ({ sentence: s, score: scoreSentence(s) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxSentences)
+    .map(obj => obj.sentence);
+
+  return ranked.join(" ");
 }
 
 // -----------------------------------------
@@ -59,7 +111,7 @@ export default async function handler(req, res) {
     ];
     REMOVE_SELECTORS.forEach(sel => $(sel).remove());
 
-    // MAIN CONTENT
+    // Extract main content
     const MAIN_SELECTORS = [
       "article",".article",".post",".main-content",
       ".story",".content","#content"
@@ -82,14 +134,13 @@ export default async function handler(req, res) {
       .replace(/var .*?;/gs, "")
       .trim();
 
-    // REMOVE USELESS NEWS PHRASES
+    // REMOVE common noises
     const REMOVE_PHRASES = [
       "ADVERTISEMENT","ADVERTISEMENT CONTINUE READING",
       "30 SEC READ","READ |","CLICK HERE","SUBSCRIBE NOW",
       "SCROLL TO CONTINUE","TRENDING","LIVE UPDATES",
       "Premium Story","You May Like"
     ];
-
     REMOVE_PHRASES.forEach(p => {
       const regex = new RegExp(p, "gi");
       content = content.replace(regex, "");
@@ -100,21 +151,14 @@ export default async function handler(req, res) {
     let uniqueSentences = [...new Set(sentences)];
     content = uniqueSentences.join(". ").trim();
 
-    // ----------------------------------------
-    // ADD FREE SUMMARIZER HERE
-    // ----------------------------------------
-    let summary = "";
-    try {
-      const summarizer = new SummarizerManager(content, 4);  // 4 sentences summary
-      const summaryObj = await summarizer.getSummaryByRank();
-      summary = summaryObj.summary || "";
-    } catch (e) {
-      summary = "Summary generation failed.";
-    }
+    // -----------------------------------------
+    // SUMMARY (SUPER CLEAN VERSION)
+    // -----------------------------------------
+    const summary = cleanAndSummarize(content, 5);
 
-    // ---------------------------------------------
-    // CONTENT IMAGES
-    // ---------------------------------------------
+    // -----------------------------------------
+    // IMAGES (deduplicated)
+    // -----------------------------------------
     const VALID_EXT = [".jpg",".jpeg",".png",".webp",".gif"];
     const BAD_PATTERNS = ["logo","icon","sprite","default","ads","pixel","banner"];
 
@@ -144,9 +188,9 @@ export default async function handler(req, res) {
 
     const images = [...new Set(rawImages)];
 
-    // ---------------------------------------------
-    // VIDEOS
-    // ---------------------------------------------
+    // -----------------------------------------
+    // VIDEOS (deduplicated)
+    // -----------------------------------------
     const VIDEO_SELECTORS = [
       "article iframe",".content iframe",".post iframe",".story iframe",
       ".content video","article video"
@@ -164,9 +208,9 @@ export default async function handler(req, res) {
 
     const videos = [...new Set(rawVideos)];
 
-    // ---------------------------------------------
-    // LINKS
-    // ---------------------------------------------
+    // -----------------------------------------
+    // LINKS (deduplicated)
+    // -----------------------------------------
     const BAD_LINKS = ["facebook.com","twitter.com","x.com","instagram.com","whatsapp.com","share="];
 
     let rawLinks = $("a").map((i, el) => $(el).attr("href")).get();
@@ -178,13 +222,13 @@ export default async function handler(req, res) {
 
     links = [...new Set(links)];
 
-    // ---------------------------------------------
-    // RESPONSE
-    // ---------------------------------------------
+    // -----------------------------------------
+    // FINAL RESPONSE
+    // -----------------------------------------
     const result = {
       url,
       title: $("title").text().trim(),
-      summary,      // ← added summary here
+      summary,       // <-- NEW CLEAN SUMMARY
       content,
       images,
       videos,
