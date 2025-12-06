@@ -1,5 +1,6 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
+import { SummarizerManager } from "node-summarizer";
 
 // -----------------------------------------
 // GLOBAL CACHE
@@ -99,8 +100,20 @@ export default async function handler(req, res) {
     let uniqueSentences = [...new Set(sentences)];
     content = uniqueSentences.join(". ").trim();
 
+    // ----------------------------------------
+    // ADD FREE SUMMARIZER HERE
+    // ----------------------------------------
+    let summary = "";
+    try {
+      const summarizer = new SummarizerManager(content, 4);  // 4 sentences summary
+      const summaryObj = await summarizer.getSummaryByRank();
+      summary = summaryObj.summary || "";
+    } catch (e) {
+      summary = "Summary generation failed.";
+    }
+
     // ---------------------------------------------
-    // CONTENT IMAGES (clean + deduplicated)
+    // CONTENT IMAGES
     // ---------------------------------------------
     const VALID_EXT = [".jpg",".jpeg",".png",".webp",".gif"];
     const BAD_PATTERNS = ["logo","icon","sprite","default","ads","pixel","banner"];
@@ -132,7 +145,7 @@ export default async function handler(req, res) {
     const images = [...new Set(rawImages)];
 
     // ---------------------------------------------
-    // VIDEOS (deduplicated)
+    // VIDEOS
     // ---------------------------------------------
     const VIDEO_SELECTORS = [
       "article iframe",".content iframe",".post iframe",".story iframe",
@@ -140,7 +153,6 @@ export default async function handler(req, res) {
     ];
 
     let rawVideos = [];
-
     VIDEO_SELECTORS.forEach(sel => {
       $(sel).each((i, el) => {
         let src = $(el).attr("src");
@@ -153,7 +165,7 @@ export default async function handler(req, res) {
     const videos = [...new Set(rawVideos)];
 
     // ---------------------------------------------
-    // LINKS (deduplicated + remove social)
+    // LINKS
     // ---------------------------------------------
     const BAD_LINKS = ["facebook.com","twitter.com","x.com","instagram.com","whatsapp.com","share="];
 
@@ -172,6 +184,7 @@ export default async function handler(req, res) {
     const result = {
       url,
       title: $("title").text().trim(),
+      summary,      // ← added summary here
       content,
       images,
       videos,
