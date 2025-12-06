@@ -22,62 +22,9 @@ function setCache(key, data, ttl) {
 }
 
 // -----------------------------------------
-// CLEAN + COMPRESS SUMMARIZER
-// -----------------------------------------
-function cleanAndSummarize(text, maxSentences = 5) {
-  if (!text || text.length < 50) return text;
-
-  // Remove junk phrases
-  const JUNK = [
-    "skip to content", "premium", "ADVERTISEMENT",
-    "trending", "click here", "subscribe now",
-    "live updates", "share", "comments", "print",
-    "you may like", "continue reading"
-  ];
-
-  JUNK.forEach(j => {
-    const reg = new RegExp(j, "gi");
-    text = text.replace(reg, "");
-  });
-
-  // Convert into cleaned sentences
-  let sentences = text
-    .split(/(?<=[.?!])\s+/)
-    .map(s => s.trim())
-    .filter(s => s.length > 25); // remove tiny useless lines
-
-  // Remove duplicate sentences
-  let unique = [...new Set(sentences)];
-
-  if (unique.length <= maxSentences) return unique.join(" ");
-
-  // Word frequency scoring
-  const freq = {};
-  unique.join(" ").toLowerCase().split(/\W+/).forEach(word => {
-    if (word.length > 3) freq[word] = (freq[word] || 0) + 1;
-  });
-
-  function scoreSentence(sentence) {
-    return sentence
-      .toLowerCase()
-      .split(/\W+/)
-      .reduce((acc, w) => acc + (freq[w] || 0), 0);
-  }
-
-  // Rank and take top sentences
-  let ranked = unique
-    .map(s => ({ sentence: s, score: scoreSentence(s) }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, maxSentences)
-    .map(obj => obj.sentence);
-
-  return ranked.join(" ");
-}
-
-// -----------------------------------------
 
 export default async function handler(req, res) {
-  // ENABLE CORS
+  // Enable CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "*");
@@ -87,6 +34,7 @@ export default async function handler(req, res) {
   try {
     const { url, ttl } = req.query;
     const cacheTTL = ttl ? parseInt(ttl) * 1000 : DEFAULT_TTL;
+
     if (!url) return res.status(400).json({ error: "URL is required." });
 
     const cacheKey = `scrape:${url}`;
@@ -101,122 +49,139 @@ export default async function handler(req, res) {
     const html = response.data;
     const $ = cheerio.load(html);
 
-    // Remove junk
+    // -----------------------------------------
+    // REMOVE JUNK ELEMENTS COMPLETELY
+    // -----------------------------------------
     const REMOVE_SELECTORS = [
       "script","style","noscript","header","footer","nav",
       "iframe","form","button","svg","canvas",
       ".ads",".ad",".advertisement",".sponsored",".promo",
       ".share",".social",".cookie",".newsletter",
-      ".popup",".modal",".breadcrumb",".banner"
+      ".popup",".modal",".breadcrumb",".banner",
+      ".related","aside",".sidebar","section.widget",
+      "link[rel=stylesheet]"
     ];
     REMOVE_SELECTORS.forEach(sel => $(sel).remove());
 
-    // Extract main content
+    // -----------------------------------------
+    // MAIN CONTENT EXTRACTION
+    // -----------------------------------------
     const MAIN_SELECTORS = [
-      "article",".article",".post",".main-content",
-      ".story",".content","#content"
+      "article",
+      ".article",
+      ".post",
+      ".main-content",
+      ".content",
+      ".story",
+      "#content"
     ];
 
     let content = "";
     for (let sel of MAIN_SELECTORS) {
-      if ($(sel).text().trim().length > 120) {
+      if ($(sel).text().trim().length > 150) {
         content = $(sel).text();
         break;
       }
     }
-    if (content.length < 120) content = $("body").text();
 
-    // BASIC CLEANING
+    // fallback
+    if (content.length < 150) content = $("body").text();
+
+    // TEXT CLEANING
     content = content
       .replace(/\s+/g, " ")
       .replace(/<!--.*?-->/gs, "")
       .replace(/function.*?\}/gs, "")
       .replace(/var .*?;/gs, "")
+      .replace(/ADVERTISEMENT/gi, "")
       .trim();
 
-    // REMOVE common noises
-    const REMOVE_PHRASES = [
-      "ADVERTISEMENT","ADVERTISEMENT CONTINUE READING",
-      "30 SEC READ","READ |","CLICK HERE","SUBSCRIBE NOW",
-      "SCROLL TO CONTINUE","TRENDING","LIVE UPDATES",
-      "Premium Story","You May Like"
-    ];
-    REMOVE_PHRASES.forEach(p => {
-      const regex = new RegExp(p, "gi");
-      content = content.replace(regex, "");
-    });
-
     // REMOVE DUPLICATE SENTENCES
-    let sentences = content.split(/[.!?]+/).map(s => s.trim());
-    let uniqueSentences = [...new Set(sentences)];
-    content = uniqueSentences.join(". ").trim();
+    const cleanSentences = [...new Set(content.split(/[.!?]+/).map(s => s.trim()))];
+    content = cleanSentences.join(". ").trim();
 
     // -----------------------------------------
-    // SUMMARY (SUPER CLEAN VERSION)
+    // IMAGE FILTERING — ONLY REAL ARTICLE IMAGES
     // -----------------------------------------
-    const summary = cleanAndSummarize(content, 5);
-
-    // -----------------------------------------
-    // IMAGES (deduplicated)
-    // -----------------------------------------
-    const VALID_EXT = [".jpg",".jpeg",".png",".webp",".gif"];
-    const BAD_PATTERNS = ["logo","icon","sprite","default","ads","pixel","banner"];
+    const VALID_EXT = [".jpg",".jpeg",".png",".webp"];
+    const BAD_PATTERNS = [
+      "logo","icon","sprite","default","placeholder",
+      "ads","advert","banner","pixel","tracking","share",
+      "social","thumb","small","mini","favicon","og-image"
+    ];
 
     const IMAGE_SELECTORS = [
-      "article img",".article img",".post img",".story img",
-      ".content img",".main-content img","img.size-large"
+      "article img",
+      ".article img",
+      ".post img",
+      ".story img",
+      ".content img",
+      ".main-content img",
+      "img[loading='lazy']"
     ];
 
-    let rawImages = [];
+    let images = [];
 
-    function isValidImage(src) {
+    function isGoodImage(src) {
       if (!src) return false;
       const lower = src.toLowerCase();
-      if (!VALID_EXT.some(e => lower.includes(e))) return false;
-      if (BAD_PATTERNS.some(b => lower.includes(b))) return false;
+      if (!VALID_EXT.some(ext => lower.includes(ext))) return false;
+      if (BAD_PATTERNS.some(bad => lower.includes(bad))) return false;
+      if (lower.includes("logo")) return false;
+      if (lower.includes("icon")) return false;
+      if (lower.length < 15) return false;
       return true;
     }
 
     IMAGE_SELECTORS.forEach(sel => {
       $(sel).each((i, el) => {
-        let src = $(el).attr("src") || $(el).attr("data-src");
-        if (isValidImage(src)) {
-          try { rawImages.push(new URL(src, url).href); } catch {}
+        let src = $(el).attr("src") || $(el).attr("data-src") || "";
+        if (isGoodImage(src)) {
+          try {
+            images.push(new URL(src, url).href);
+          } catch {}
         }
       });
     });
 
-    const images = [...new Set(rawImages)];
+    images = [...new Set(images)];
 
     // -----------------------------------------
-    // VIDEOS (deduplicated)
+    // VIDEO FILTERING
     // -----------------------------------------
     const VIDEO_SELECTORS = [
-      "article iframe",".content iframe",".post iframe",".story iframe",
-      ".content video","article video"
+      "article iframe",
+      ".post iframe",
+      ".story iframe",
+      ".content iframe",
+      "article video",
+      ".content video"
     ];
 
-    let rawVideos = [];
+    let videos = [];
+
     VIDEO_SELECTORS.forEach(sel => {
       $(sel).each((i, el) => {
-        let src = $(el).attr("src");
+        let src = $(el).attr("src") || $(el).attr("data-src");
         if (src && src.startsWith("http")) {
-          try { rawVideos.push(new URL(src, url).href); } catch {}
+          try {
+            videos.push(new URL(src, url).href);
+          } catch {}
         }
       });
     });
 
-    const videos = [...new Set(rawVideos)];
+    videos = [...new Set(videos)];
 
     // -----------------------------------------
-    // LINKS (deduplicated)
+    // LINKS – Deduped & Clean
     // -----------------------------------------
     const BAD_LINKS = ["facebook.com","twitter.com","x.com","instagram.com","whatsapp.com","share="];
 
-    let rawLinks = $("a").map((i, el) => $(el).attr("href")).get();
-
-    let links = rawLinks
-      .filter(h => h)
+    let links = $("a")
+      .map((i, el) => $(el).attr("href"))
+      .get()
+      .filter(Boolean)
       .map(h => { try { return new URL(h, url).href; } catch { return null; }})
       .filter(h => h && !BAD_LINKS.some(b => h.includes(b)));
 
@@ -228,13 +193,12 @@ export default async function handler(req, res) {
     const result = {
       url,
       title: $("title").text().trim(),
-      summary,       // <-- NEW CLEAN SUMMARY
       content,
       images,
       videos,
       links,
       length: {
-        textLength: content.length,
+        text: content.length,
         images: images.length,
         videos: videos.length,
         links: links.length
@@ -243,7 +207,11 @@ export default async function handler(req, res) {
 
     setCache(cacheKey, result, cacheTTL);
 
-    return res.status(200).json({ success: true, cached: false, ...result });
+    return res.status(200).json({
+      success: true,
+      cached: false,
+      ...result
+    });
 
   } catch (err) {
     return res.status(500).json({
