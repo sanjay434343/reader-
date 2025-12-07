@@ -47,50 +47,55 @@ function generateContentHash(text) {
 }
 
 // =============================================================================
-// SMART CHUNKING: 4000 characters with sentence boundaries
+// SPLIT CONTENT BY WORD COUNT (3000 words per part)
 // =============================================================================
 
-function chunkText(text, maxSize = 4000) {
-  const chunks = [];
-  text = text.replace(/\s+/g, " ").trim();
+function splitContentByWords(text, wordsPerPart = 3000) {
+  const words = text.split(/\s+/).filter(w => w.length > 0);
+  const parts = [];
   
-  if (text.length <= maxSize) {
-    return [text];
-  }
-
-  const sentences = text.split(/(?<=[.!?])\s+/);
-  let currentChunk = "";
-  
-  for (const sentence of sentences) {
-    if (sentence.length > maxSize) {
-      if (currentChunk) {
-        chunks.push(currentChunk.trim());
-        currentChunk = "";
-      }
-      
-      for (let i = 0; i < sentence.length; i += maxSize) {
-        chunks.push(sentence.slice(i, i + maxSize));
-      }
-      continue;
-    }
-    
-    if ((currentChunk + " " + sentence).length <= maxSize) {
-      currentChunk += (currentChunk ? " " : "") + sentence;
-    } else {
-      chunks.push(currentChunk.trim());
-      currentChunk = sentence;
+  for (let i = 0; i < words.length; i += wordsPerPart) {
+    const part = words.slice(i, i + wordsPerPart).join(' ');
+    if (part.trim().length > 0) {
+      parts.push({
+        partNumber: parts.length + 1,
+        content: part.trim(),
+        wordCount: part.trim().split(/\s+/).length,
+        charCount: part.trim().length
+      });
     }
   }
   
-  if (currentChunk) {
-    chunks.push(currentChunk.trim());
-  }
-  
-  return chunks;
+  return parts;
 }
 
 // =============================================================================
-// AGGRESSIVE CONTENT EXTRACTION: Get ALL text from page
+// AI SUMMARY GENERATOR using Pollinations API
+// =============================================================================
+
+async function generateSummary(content, partNumber, totalParts) {
+  try {
+    const prompt = `Summarize the following content (Part ${partNumber} of ${totalParts}) in 3-5 concise bullet points:
+
+${content.substring(0, 2000)}...`; // Limit content length for API
+
+    const encodedPrompt = encodeURIComponent(prompt);
+    const response = await axios.get(`https://text.pollinations.ai/${encodedPrompt}`, {
+      timeout: 30000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+
+    return response.data || "Summary generation failed";
+  } catch (err) {
+    console.error(`Summary generation error for part ${partNumber}:`, err.message);
+    return `Summary unavailable for part ${partNumber}`;
+  }
+}
+
+// =============================================================================
+// AGGRESSIVE CONTENT EXTRACTION
 // =============================================================================
 
 class FullContentExtractor {
@@ -102,7 +107,6 @@ class FullContentExtractor {
   extractAllContent() {
     const $ = this.$;
     
-    // Remove all unwanted elements first
     const REMOVE_SELECTORS = [
       "script", "style", "noscript", "canvas", "svg",
       "header", "footer", "nav", "aside",
@@ -125,24 +129,17 @@ class FullContentExtractor {
     
     REMOVE_SELECTORS.forEach(sel => $(sel).remove());
 
-    // Site-specific selectors (Times of India, etc.)
     const PRIORITY_SELECTORS = [
-      // Times of India specific
       ".article_content", ".artText", ".Normal", 
       "div[data-articlebody]", ".story-content",
-      // BBC
       "[data-component='text-block']", ".ssrcss-1q0x1qg-Paragraph",
-      // The Hindu
       ".articlebodycontent", ".article-content",
-      // NDTV
       ".sp-cn", ".story__content",
-      // Generic
       "article", "main", "[role='main']",
       ".article-body", ".post-content", ".entry-content",
       ".story-body", ".content-body", ".article_body"
     ];
 
-    // Try priority selectors first
     for (const selector of PRIORITY_SELECTORS) {
       const element = $(selector);
       if (element.length > 0) {
@@ -153,11 +150,9 @@ class FullContentExtractor {
       }
     }
 
-    // Fallback: Extract ALL paragraphs
     let allParagraphs = [];
     $("p").each((i, el) => {
       const text = $(el).text().trim();
-      // Filter out very short paragraphs and author bios
       if (text.length > 25 && 
           !text.toLowerCase().includes("toi tech desk") &&
           !text.toLowerCase().includes("journalist") &&
@@ -170,13 +165,11 @@ class FullContentExtractor {
       return allParagraphs.join(" ");
     }
 
-    // Fallback: Extract from divs with substantial text
     let contentDivs = [];
     $("div").each((i, el) => {
       const $el = $(el);
       const paragraphs = $el.find("p");
       
-      // If div contains multiple paragraphs, it's likely content
       if (paragraphs.length >= 3) {
         const text = $el.text().trim();
         if (text.length > 500) {
@@ -186,12 +179,10 @@ class FullContentExtractor {
     });
 
     if (contentDivs.length > 0) {
-      // Get the longest one (likely the main article)
       contentDivs.sort((a, b) => b.length - a.length);
       return contentDivs[0];
     }
 
-    // Last resort: get all body text
     return $("body").text().trim();
   }
 
@@ -214,7 +205,7 @@ class FullContentExtractor {
 }
 
 // =============================================================================
-// AGGRESSIVE TEXT CLEANING PIPELINE
+// AGGRESSIVE TEXT CLEANING
 // =============================================================================
 
 class AggressiveTextCleaner {
@@ -355,7 +346,7 @@ class AggressiveTextCleaner {
     const sentences = this.text
       .split(/[.!?]+/)
       .map(s => s.trim())
-      .filter(s => s.length > 10);  // Keep only substantial sentences
+      .filter(s => s.length > 10);
     
     const unique = [...new Set(sentences)];
     this.text = unique.join(". ");
@@ -533,13 +524,14 @@ export default async function handler(req, res) {
   const startTime = Date.now();
 
   try {
-    const { url, ttl, format = "json" } = req.query;
+    const { url, ttl, format = "json", summarize = "true" } = req.query;
     const cacheTTL = ttl ? parseInt(ttl) * 1000 : DEFAULT_TTL;
+    const shouldSummarize = summarize === "true";
 
     if (!url) {
       return res.status(400).json({ 
         error: "URL is required",
-        usage: "?url=<URL>&ttl=<seconds>&format=<json|text>"
+        usage: "?url=<URL>&ttl=<seconds>&format=<json|text>&summarize=<true|false>"
       });
     }
 
@@ -555,7 +547,7 @@ export default async function handler(req, res) {
     }
 
     // Cache check
-    const cacheKey = `scrape:${generateContentHash(url)}`;
+    const cacheKey = `scrape:${generateContentHash(url)}:${shouldSummarize}`;
     const cached = CACHE.get(cacheKey);
     
     if (cached) {
@@ -582,17 +574,31 @@ export default async function handler(req, res) {
     const html = response.data;
     const $ = cheerio.load(html);
 
-    // Extract ALL content
+    // Extract content
     const extractor = new FullContentExtractor($, url);
     const rawContent = extractor.extractAllContent();
     const metadata = extractor.extractMetadata();
 
-    // Aggressive cleaning
+    // Clean content
     const cleaner = new AggressiveTextCleaner(rawContent);
     const cleanedContent = cleaner.clean();
 
-    // Chunk into 4000 character pieces
-    const chunks = chunkText(cleanedContent, 4000);
+    // Split content into 3000-word parts
+    const contentParts = splitContentByWords(cleanedContent, 3000);
+
+    // Generate summaries for each part (if enabled)
+    if (shouldSummarize) {
+      console.log(`Generating summaries for ${contentParts.length} content parts...`);
+      
+      for (let i = 0; i < contentParts.length; i++) {
+        const summary = await generateSummary(
+          contentParts[i].content, 
+          i + 1, 
+          contentParts.length
+        );
+        contentParts[i].summary = summary;
+      }
+    }
 
     // Extract media
     const mediaExtractor = new MediaExtractor($, url);
@@ -603,17 +609,18 @@ export default async function handler(req, res) {
     const result = {
       url,
       metadata,
-      chunks,
-      fullText: cleanedContent, // Include full cleaned text
+      contentParts,
+      fullText: cleanedContent,
       images,
       videos,
       statistics: {
-        chunks: chunks.length,
+        totalParts: contentParts.length,
         images: images.length,
         videos: videos.length,
         totalChars: cleanedContent.length,
         totalWords: cleanedContent.split(/\s+/).length,
-        processingTime: Date.now() - startTime
+        processingTime: Date.now() - startTime,
+        summarized: shouldSummarize
       }
     };
 
@@ -623,7 +630,15 @@ export default async function handler(req, res) {
     // Format response
     if (format === "text") {
       res.setHeader("Content-Type", "text/plain");
-      return res.status(200).send(cleanedContent);
+      let textOutput = cleanedContent;
+      
+      if (shouldSummarize) {
+        textOutput = contentParts.map((part, idx) => {
+          return `\n=== PART ${idx + 1} ===\n${part.content}\n\n--- SUMMARY ---\n${part.summary}`;
+        }).join('\n\n');
+      }
+      
+      return res.status(200).send(textOutput);
     }
 
     return res.status(200).json({ 
