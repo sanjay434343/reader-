@@ -39,9 +39,8 @@ const CACHE = new LRUCache(150);
 const DEFAULT_TTL = 600 * 1000;
 
 // =============================================================================
-// NEWS SITES PLACEHOLDER (NOT INCLUDED AS REQUESTED)
+// NEWS_SITES PLACEHOLDER — You will insert your list separately
 // =============================================================================
-
 const NEWS_SITES = [
   // === GENERAL NEWS - INDIA (50 sources) ===
   { name: "Indian Express", url: q => `https://indianexpress.com/?s=${q}`, category: "general", region: "India" },
@@ -557,31 +556,35 @@ const NEWS_SITES = [
   { name: "InStyle", url: q => `https://www.instyle.com/search?q=${q}`, category: "lifestyle", region: "USA" },
   { name: "Who What Wear", url: q => `https://www.whowhatwear.com/search?q=${q}`, category: "lifestyle", region: "USA" }
 ];
-// You will insert your massive NEWS_SITES list here yourself.
-// The rest of the code fully works without printing it.
+
 
 // =============================================================================
 // UNIVERSAL SCRAPER FOR bestUrls (Dynamic Summaries)
+// WITH DELAY BETWEEN REQUESTS
 // =============================================================================
 
+// Delay utility
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Scrape + summarize one URL using your API
 async function summarizeArticle(url) {
   try {
     const apiUrl = `https://reader-zeta-three.vercel.app/api/scrape?url=${encodeURIComponent(url)}`;
 
-    const response = await axios.get(apiUrl, { timeout: 10000 });
+    const response = await axios.get(apiUrl, { timeout: 15000 });
     const data = response.data;
 
-    const title = data.title || "No Title Found";
-    const text = data.content || "";
+    const title = data.metadata?.title || data.title || "No Title Found";
+    const text = data.fullText || data.content || "";
 
-    // Create a clean sentence list
     const sentences = text
       .replace(/\n+/g, " ")
       .split(".")
       .map(s => s.trim())
       .filter(s => s.length > 30);
 
-    // Ensure min 3 summaries, unlimited max
     const summary = sentences.slice(0, Math.max(3, sentences.length));
 
     return {
@@ -599,27 +602,35 @@ async function summarizeArticle(url) {
   }
 }
 
+// Process URLs with delay between each API call
 async function processBestUrls(bestUrls) {
-  const output = [];
+  const results = [];
+
+  const DELAY_MS = 1500; // 1.5 seconds delay between requests
+
   for (const url of bestUrls) {
-    const s = await summarizeArticle(url);
-    output.push(s);
+    const one = await summarizeArticle(url);
+    results.push(one);
+
+    await delay(DELAY_MS);
   }
-  return output;
+
+  return results;
 }
 
-// =============================================================================
-// CLAUDE AI URL RANKING
-// =============================================================================
 
+
+// =============================================================================
+// CLAUDE AI RANKING
+// =============================================================================
 async function analyzeWithClaude(query, results) {
   try {
     const topResults = results.slice(0, 15);
 
-    const resultsText = topResults
+    const resultBlock = topResults
       .map(
         (r, i) =>
-          `${i + 1}. [${r.site}] ${r.title}\nURL: ${r.url}\nScore: ${r.score}`
+          `${i + 1}. ${r.title}\nURL: ${r.url}\nScore: ${r.score}`
       )
       .join("\n\n");
 
@@ -631,149 +642,156 @@ async function analyzeWithClaude(query, results) {
         messages: [
           {
             role: "user",
-            content: `Analyze these search results for the query: "${query}"
+            content: `Analyze these results for the query: "${query}"
 
-${resultsText}
+${resultBlock}
 
-Return ONLY a JSON object with:
-1. "bestUrls": array of 3-5 URLs
-2. "reasoning": short explanation
-3. "category": one of: technology, business, sports, health, science, general, politics, entertainment
-
-Respond ONLY with JSON.`
+Return ONLY JSON:
+{
+  "bestUrls": [...],
+  "reasoning": "...",
+  "category": "..."
+}`
           }
         ]
       },
       {
-        headers: { "Content-Type": "application/json" },
-        timeout: 10000
+        headers: {
+          "Content-Type": "application/json",
+        },
+        timeout: 15000
       }
     );
 
-    const rawText = response.data.content
+    const text = response.data.content
       .filter(b => b.type === "text")
       .map(b => b.text)
       .join("")
-      .trim();
+      .trim()
+      .replace(/```json|```/g, "");
 
-    const clean = rawText.replace(/```json|```/g, "");
-    return JSON.parse(clean);
+    return JSON.parse(text);
+
   } catch (err) {
     return null;
   }
 }
 
+
+
 // =============================================================================
 // CATEGORY DETECTION FALLBACK
 // =============================================================================
-
 async function detectCategory(query) {
   try {
     const prompt = encodeURIComponent(
-      `Detect category (one word): general, sports, science, business, entertainment, technology, health, politics. Query: "${query}"`
+      `Detect category for: "${query}". Return only: business, tech, sports, politics, science, health, general`
     );
 
-    const response = await axios.get(`https://text.pollinations.ai/${prompt}`, {
-      timeout: 5000
-    });
+    const response = await axios.get(
+      `https://text.pollinations.ai/${prompt}`,
+      { timeout: 5000 }
+    );
 
     const out = response.data.toLowerCase().trim();
     const valid = [
-      "general",
-      "sports",
-      "science",
       "business",
-      "entertainment",
-      "technology",
+      "tech",
+      "sports",
+      "politics",
+      "science",
       "health",
-      "politics"
+      "general"
     ];
 
     return valid.includes(out) ? out : "general";
+
   } catch {
     return "general";
   }
 }
 
-// =============================================================================
-// DUCKDUCKGO FALLBACK SEARCH
-// =============================================================================
 
+
+// =============================================================================
+// DUCKDUCKGO FALLBACK
+// =============================================================================
 async function searchDuckDuckGo(query) {
   try {
-    const response = await axios.get("https://api.duckduckgo.com/", {
+    const res = await axios.get("https://api.duckduckgo.com/", {
       params: {
         q: query,
         format: "json",
         no_html: 1,
-        skip_disambig: 1
+        skip_disambig: 1,
       },
-      timeout: 5000
+      timeout: 7000
     });
 
     const results = [];
 
-    if (response.data.AbstractURL) {
+    if (res.data.AbstractURL) {
       results.push({
         site: "DuckDuckGo",
         category: "general",
-        title: response.data.Heading || query,
-        description: response.data.AbstractText || "",
-        url: response.data.AbstractURL,
-        score: 100,
-        region: "Global"
+        region: "Global",
+        title: res.data.Heading || query,
+        description: res.data.AbstractText || "",
+        url: res.data.AbstractURL,
+        score: 100
       });
     }
 
-    if (response.data.RelatedTopics) {
-      response.data.RelatedTopics.forEach(t => {
+    if (res.data.RelatedTopics) {
+      res.data.RelatedTopics.forEach(t => {
         if (t.FirstURL && t.Text) {
           results.push({
             site: "DuckDuckGo",
             category: "general",
-            title: t.Text.substring(0, 200),
+            region: "Global",
+            title: t.Text,
             description: t.Text,
             url: t.FirstURL,
-            score: 80,
-            region: "Global"
+            score: 80
           });
         }
       });
     }
 
     return results;
+
   } catch {
     return [];
   }
 }
 
+
+
 // =============================================================================
 // URL VALIDATION
 // =============================================================================
-
 function isValidArticle(url) {
   if (!url) return false;
 
-  const bad = [
-    "facebook.com",
+  const blocked = [
     "pinterest.com",
-    "x.com",
-    "twitter.com",
+    "facebook.com",
     "instagram.com",
-    "/tag/",
-    "/topic/",
     "login",
     "subscribe",
-    "signup"
+    "signup",
+    "/tag/",
+    "/topic/"
   ];
 
-  return !bad.some(p => url.toLowerCase().includes(p));
+  return !blocked.some(p => url.toLowerCase().includes(p));
 }
 
-// =============================================================================
-// SCORING ALGO
-// =============================================================================
 
+
+// =============================================================================
+// RESULT SCORING
+// =============================================================================
 function scoreResult(url, title, description, words) {
   let score = 0;
   const text = `${title} ${description}`.toLowerCase();
@@ -788,24 +806,23 @@ function scoreResult(url, title, description, words) {
   return score;
 }
 
+
+
 // =============================================================================
 // SCRAPE NEWS SITE
 // =============================================================================
-
 async function scrapeSite(site, query, words) {
   try {
     const url = site.url(query);
 
-    const resp = await axios.get(url, {
+    const res = await axios.get(url, {
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Safari/537.36"
+        "User-Agent": "Mozilla/5.0"
       },
       timeout: 9000
     });
 
-    const $ = cheerio.load(resp.data);
-
+    const $ = cheerio.load(res.data);
     const out = [];
 
     $("a").each((i, el) => {
@@ -846,30 +863,35 @@ async function scrapeSite(site, query, words) {
     });
 
     return out;
+
   } catch {
     return [];
   }
 }
 
-// =============================================================================
-// DEDUPLICATION
-// =============================================================================
 
-function dedupe(results) {
+
+// =============================================================================
+// DEDUPLICATE RESULTS
+// =============================================================================
+function dedupe(list) {
   const map = new Map();
-  results.forEach(r => {
+
+  list.forEach(r => {
     const key = r.url.toLowerCase();
     if (!map.has(key) || map.get(key).score < r.score) {
       map.set(key, r);
     }
   });
+
   return [...map.values()];
 }
 
-// =============================================================================
-// MAIN SEARCH HANDLER WITH DYNAMIC SUMMARY GENERATION
-// =============================================================================
 
+
+// =============================================================================
+// MAIN SEARCH HANDLER
+// =============================================================================
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
 
@@ -880,23 +902,21 @@ export default async function handler(req, res) {
   try {
     const { q: query, limit = 20, useAI = "true" } = req.query;
 
-    if (!query) {
-      return res.status(400).json({ error: "Query parameter 'q' required" });
-    }
+    if (!query)
+      return res.status(400).json({ error: "Missing ?q= query parameter" });
 
     const cacheKey = createHash("md5").update(query).digest("hex");
     const cached = CACHE.get(cacheKey);
-    if (cached) {
-      return res.json({ ...cached, cached: true });
-    }
+
+    if (cached)
+      return res.json({ ...cached, cached: true, cacheHit: true });
 
     const detectedCategory = await detectCategory(query);
 
-    const queryWords = query.split(" ").filter(w => w.length > 2);
+    const words = query.split(" ").filter(w => w.length > 2);
 
-    // SCRAPE ALL SITES
     const scrapePromises = NEWS_SITES.map(site =>
-      scrapeSite(site, query, queryWords)
+      scrapeSite(site, query, words)
     );
 
     const ddgPromise = searchDuckDuckGo(query);
@@ -906,14 +926,13 @@ export default async function handler(req, res) {
       ddgPromise
     ]);
 
-    const all = [...scrapedLists.flat(), ...ddgResults];
-    const unique = dedupe(all);
+    const combined = [...scrapedLists.flat(), ...ddgResults];
+    const unique = dedupe(combined);
 
     unique.sort((a, b) => b.score - a.score);
 
     const top = unique.slice(0, limit * 2);
 
-    // AI chooses best URLs
     let bestUrls = top.slice(0, 5).map(r => r.url);
     let aiReason = null;
     let aiCategory = detectedCategory;
@@ -922,20 +941,19 @@ export default async function handler(req, res) {
       const ai = await analyzeWithClaude(query, top);
       if (ai) {
         bestUrls = ai.bestUrls || bestUrls;
-        aiReason = ai.reasoning || null;
+        aiReason = ai.reasoning;
         aiCategory = ai.category || detectedCategory;
       }
     }
 
-    // NEW FEATURE: get summary for each best URL
-    const detailedSummaries = await processBestUrls(bestUrls);
+    const summaries = await processBestUrls(bestUrls);
 
     const response = {
       success: true,
       query,
       detectedCategory: aiCategory,
       bestUrls,
-      summaries: detailedSummaries,
+      summaries,
       results: top.slice(0, limit),
       totalResults: unique.length,
       processingTime: Date.now() - start
@@ -943,9 +961,10 @@ export default async function handler(req, res) {
 
     CACHE.set(cacheKey, response, DEFAULT_TTL);
 
-    return res.json(response);
+    res.json(response);
+
   } catch (err) {
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
       error: err.message
     });
