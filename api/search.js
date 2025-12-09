@@ -606,7 +606,7 @@ async function summarizeArticle(url) {
 async function processBestUrls(bestUrls) {
   const results = [];
 
-  const DELAY_MS = 1500; // 1.5 seconds delay between requests
+  const DELAY_MS = 2000; // 1.5 seconds delay between requests
 
   for (const url of bestUrls) {
     const one = await summarizeArticle(url);
