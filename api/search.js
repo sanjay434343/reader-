@@ -21,7 +21,6 @@ class LRUCache {
       return null;
     }
 
-    // Move to most-recent
     this.cache.delete(key);
     this.cache.set(key, entry);
     return entry.data;
@@ -29,19 +28,18 @@ class LRUCache {
 
   set(key, data, ttl) {
     if (this.cache.size >= this.maxSize) {
-      const firstKey = this.cache.keys().next().value;
-      this.cache.delete(firstKey);
+      const first = this.cache.keys().next().value;
+      this.cache.delete(first);
     }
     this.cache.set(key, { data, ttl, timestamp: Date.now() });
   }
 }
 
 const CACHE = new LRUCache(150);
-const DEFAULT_TTL = 600_000; // 10 minutes
+const DEFAULT_TTL = 600000;
 
 // =============================================================================
-// NOTE: NEWS_SITES is intentionally left out per request.
-// Add your NEWS_SITES array elsewhere if you need site-specific scraping.
+// EMPTY NEWS_SITES BLOCK (Your full site list goes here later)
 // =============================================================================
 
 const NEWS_SITES = [
@@ -565,246 +563,211 @@ const NEWS_SITES = [
 // =============================================================================
 
 function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((res) => setTimeout(res, ms));
 }
 
-function safeText(s) {
-  if (!s) return "";
-  return String(s).replace(/\s+/g, " ").trim();
+function cleanText(str) {
+  return String(str || "").replace(/\s+/g, " ").trim();
 }
 
-function sentenceSplit(text) {
-  if (!text) return [];
-  // split by sentence-like punctuation, keep reasonably sized ones
-  const parts = text
-    .replace(/\r\n|\n|\t/g, " ")
+function splitSentences(text) {
+  return cleanText(text)
     .split(/(?<=[.?!])\s+/)
-    .map((p) => p.trim())
-    .filter((p) => p.length > 30);
-  return parts;
+    .filter((s) => s.length > 30);
 }
 
-function makeKeywordsFromQuery(q) {
-  if (!q) return [];
+function keywords(q) {
   return q
     .toLowerCase()
-    .split(/\s+/)
+    .split(" ")
     .map((w) => w.replace(/[^a-z0-9]/g, ""))
     .filter((w) => w.length > 2);
 }
 
 // =============================================================================
-// SCRAPE / SUMMARY (uses your provided scraping API)
+// SCRAPER + SUMMARY USING YOUR SCRAPE API
 // =============================================================================
-
-async function fetchScrapeApi(url) {
-  const endpoint = `https://reader-zeta-three.vercel.app/api/scrape?url=${encodeURIComponent(
-    url
-  )}`;
-  const response = await axios.get(endpoint, { timeout: 15_000 });
-  return response.data;
-}
 
 async function summarizeArticle(url) {
   try {
-    const data = await fetchScrapeApi(url);
+    const api = `https://reader-zeta-three.vercel.app/api/scrape?url=${encodeURIComponent(url)}`;
+
+    const { data } = await axios.get(api, { timeout: 15000 });
 
     const title =
-      safeText(data?.metadata?.title) ||
-      safeText(data?.metadata?.title_hn) ||
-      safeText(data?.title) ||
+      cleanText(data?.metadata?.title) ||
+      cleanText(data?.title) ||
       "No Title";
 
-    const fullText =
-      safeText(data?.fullText) ||
-      (Array.isArray(data?.contentParts) ? data.contentParts.map(p => p.content || "").join(" ") : "") ||
-      safeText(data?.content) ||
+    const full =
+      cleanText(data?.fullText) ||
+      (Array.isArray(data?.contentParts)
+        ? data.contentParts.map((p) => p.content || "").join(" ")
+        : "") ||
       "";
 
-    const sentences = sentenceSplit(fullText);
+    const sentences = splitSentences(full);
 
-    // pick up to 4 sentences as a short summary (preserve order)
-    const summary = sentences.slice(0, 4);
-
-    return { url, title, summary };
+    return {
+      url,
+      title,
+      summary: sentences.slice(0, 4)
+    };
   } catch (err) {
-    return { url, title: "Failed to load article", summary: [String(err.message || err)] };
+    return {
+      url,
+      title: "Failed to load",
+      summary: [String(err.message || err)]
+    };
   }
 }
 
 // =============================================================================
-// PROCESS BEST URLS WITH DELAY (2.0 seconds by default)
+// PROCESS bestUrls WITH 2 SECOND DELAY
 // =============================================================================
 
-async function processBestUrls(bestUrls = [], delayMs = 2000) {
-  const out = [];
-  for (const u of bestUrls) {
-    try {
-      const s = await summarizeArticle(u);
-      out.push(s);
-    } catch (e) {
-      out.push({ url: u, title: "Failed to summarise", summary: [String(e.message || e)] });
-    }
-    // enforce delay between API calls (user requested 2s or 2.5s; default 2000ms)
-    await delay(delayMs);
+async function processBestUrls(bestUrls) {
+  const output = [];
+  const DELAY_MS = 2000;
+
+  for (const url of bestUrls) {
+    const s = await summarizeArticle(url);
+    output.push(s);
+
+    await delay(DELAY_MS);
   }
-  return out;
+
+  return output;
 }
 
 // =============================================================================
-// MERGED SUMMARY: FILTERED AGAINST A REFERENCE QUERY
-// - The merged summary will include only sentences that mention one or more
-//   keywords derived from the referenceQuery (e.g., "android16 beta update").
-// - If no sentences match, it falls back to top sentences across all summaries.
-// - Output is plain English lines, no special characters added.
+// MERGED SUMMARY FILTERED BY referenceQuery
 // =============================================================================
 
-function buildMergedSummaryFiltered(summaries = [], referenceQuery = "") {
-  const keywords = makeKeywordsFromQuery(referenceQuery); // cleaned keywords
-  const collected = [];
+function buildMergedSummaryFiltered(summaries, referenceQuery) {
+  const keys = keywords(referenceQuery);
+  const lines = [];
 
-  // collect candidate sentences from individual summaries
-  for (const item of summaries) {
-    if (!item || !Array.isArray(item.summary)) continue;
-    for (const s of item.summary) {
-      const text = safeText(s);
-      if (!text) continue;
-      collected.push({ text, url: item.url, title: item.title });
-    }
-  }
-
-  // filter sentences that contain any keyword
-  const matched = collected.filter((c) => {
-    const low = c.text.toLowerCase();
-    return keywords.some((k) => k && low.includes(k));
+  summaries.forEach((item) => {
+    item.summary.forEach((sentence) => {
+      const t = cleanText(sentence);
+      if (keys.some((k) => t.toLowerCase().includes(k))) {
+        lines.push(t);
+      }
+    });
   });
 
-  // Normalize and deduplicate by text
-  const normalize = (t) => t.replace(/[^a-zA-Z0-9 ,.\-():]/g, "").trim();
+  const normalized = lines
+    .map((s) => s.replace(/[^a-zA-Z0-9 ,.]/g, "").trim())
+    .filter((s) => s.length > 20);
 
-  let finalLines = [];
-
-  if (matched.length > 0) {
-    const seen = new Set();
-    for (const m of matched) {
-      const line = normalize(m.text);
-      if (!line) continue;
-      if (seen.has(line)) continue;
-      seen.add(line);
-      finalLines.push(line);
-      if (finalLines.length >= 12) break; // keep reasonable size
-    }
-  } else {
-    // fallback: pick top sentences from all summaries (preserve original order)
-    const seen = new Set();
-    for (const c of collected) {
-      const line = normalize(c.text);
-      if (!line) continue;
-      if (seen.has(line)) continue;
-      seen.add(line);
-      finalLines.push(line);
-      if (finalLines.length >= 12) break;
-    }
+  if (normalized.length === 0) {
+    return ["No merged summary found for this topic"];
   }
 
-  // If still empty, return a small default note
-  if (finalLines.length === 0) {
-    return ["No merged summary could be created from the provided articles."];
-  }
-
-  // Return plain lines (no special bullet characters)
-  return finalLines;
+  return normalized.slice(0, 10);
 }
 
 // =============================================================================
-// SIMPLE CLAUDE / AI ANALYSIS (keeps simple basic english constraints)
-// NOTE: This is optional and used only to pick bestUrls if desired.
+// CLAUDE AI RANKER — SIMPLE BASIC ENGLISH (5–8 POINTS)
 // =============================================================================
 
-async function analyzeWithClaudeSimple(query, results) {
+async function analyzeWithClaude(query, results) {
   try {
-    const top = results.slice(0, 15);
-    const textBlock = top
-      .map((r, i) => `${i + 1}. ${r.title}\nURL: ${r.url}\nScore: ${r.score}`)
+    const top = results.slice(0, 12);
+
+    const block = top
+      .map((r, i) => `${i + 1}. ${r.title}\n${r.url}\nScore: ${r.score}`)
       .join("\n\n");
 
-    // Simple system prompt stored in a field; the anthropic API signature used below
-    const payload = {
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      messages: [
-        {
-          role: "user",
-          content: `Use simple English. Keep points short (5-8 points). Analyze these results for query: "${query}"
+    const resp = await axios.post(
+      "https://api.anthropic.com/v1/messages",
+      {
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 800,
+        system: `
+Use simple English.
+Write only 5 to 8 short points.
+No special characters.
+Return clean JSON only.
+`,
+        messages: [
+          {
+            role: "user",
+            content: `
+Analyze these results:
 
-${textBlock}
+${block}
 
-Return only valid JSON with keys: bestUrls (array of 3-5 urls), reasoning (short text), category (one word).`
-        }
-      ]
-    };
+Return JSON:
+{
+  "bestUrls": [],
+  "reasoning": "",
+  "category": ""
+}
+`
+          }
+        ]
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+        timeout: 15000
+      }
+    );
 
-    const resp = await axios.post("https://api.anthropic.com/v1/messages", payload, {
-      headers: { "Content-Type": "application/json" },
-      timeout: 15_000
-    });
+    const txt = resp.data.content
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("")
+      .replace(/```json|```/g, "")
+      .trim();
 
-    // Attempt to extract text blocks
-    const blocks = Array.isArray(resp.data?.content)
-      ? resp.data.content.filter((b) => b.type === "text").map((b) => b.text).join("")
-      : String(resp.data?.content || "");
-
-    const cleaned = blocks.replace(/```json|```/g, "").trim();
-
-    try {
-      const parsed = JSON.parse(cleaned);
-      return parsed;
-    } catch {
-      return null;
-    }
-  } catch (e) {
+    return JSON.parse(txt);
+  } catch {
     return null;
   }
 }
 
 // =============================================================================
-// SIMPLE DUCKDUCKGO SEARCH (fallback)
+// DUCKDUCKGO FALLBACK
 // =============================================================================
 
 async function searchDuckDuckGo(query) {
   try {
-    const resp = await axios.get("https://api.duckduckgo.com/", {
-      params: { q: query, format: "json", no_html: 1, skip_disambig: 1 },
+    const r = await axios.get("https://api.duckduckgo.com/", {
+      params: {
+        q: query,
+        format: "json",
+        no_html: 1,
+        skip_disambig: 1
+      },
       timeout: 8000
     });
 
     const out = [];
-    if (resp.data?.AbstractURL) {
+
+    if (r.data.AbstractURL) {
       out.push({
         site: "DuckDuckGo",
-        category: "general",
-        region: "Global",
-        title: resp.data.Heading || query,
-        description: resp.data.AbstractText || "",
-        url: resp.data.AbstractURL,
-        score: 100
+        title: r.data.Heading,
+        description: r.data.AbstractText,
+        url: r.data.AbstractURL,
+        score: 80
       });
     }
-    if (Array.isArray(resp.data?.RelatedTopics)) {
-      resp.data.RelatedTopics.forEach((t) => {
-        if (t.FirstURL && t.Text) {
-          out.push({
-            site: "DuckDuckGo",
-            category: "general",
-            region: "Global",
-            title: t.Text,
-            description: t.Text,
-            url: t.FirstURL,
-            score: 80
-          });
-        }
-      });
-    }
+
+    (r.data.RelatedTopics || []).forEach((t) => {
+      if (t.FirstURL && t.Text) {
+        out.push({
+          site: "DuckDuckGo",
+          title: t.Text,
+          description: t.Text,
+          url: t.FirstURL,
+          score: 50
+        });
+      }
+    });
+
     return out;
   } catch {
     return [];
@@ -812,76 +775,47 @@ async function searchDuckDuckGo(query) {
 }
 
 // =============================================================================
-// BASIC SCRAPE SITE (used if NEWS_SITES provided externally)
+// SIMPLE WEBSITE SCRAPER (NEWS_SITES entries use this)
 // =============================================================================
-
-function isValidArticle(url) {
-  if (!url) return false;
-  const bad = [
-    "facebook.com",
-    "instagram.com",
-    "pinterest.com",
-    "twitter.com",
-    "x.com",
-    "login",
-    "signup",
-    "/tag/",
-    "/topic/",
-    "subscribe",
-    "mailto:"
-  ];
-  return !bad.some((b) => url.includes(b));
-}
-
-function scoreResult(url = "", title = "", description = "", words = []) {
-  let score = 0;
-  const t = (title || "").toLowerCase();
-  const d = (description || "").toLowerCase();
-  const u = (url || "").toLowerCase();
-
-  for (const w of words) {
-    if (!w) continue;
-    if (t.includes(w)) score += 10;
-    if (d.includes(w)) score += 4;
-    if (u.includes(w)) score += 2;
-  }
-
-  // small length bonus
-  if ((title || "").length > 60) score += 2;
-
-  return score;
-}
 
 async function scrapeSite(site, query, words) {
   try {
-    const searchUrl = site.url(query);
-    const r = await axios.get(searchUrl, { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000 });
-    const $ = cheerio.load(r.data);
-    const results = [];
+    const url = site.url(query);
+
+    const { data } = await axios.get(url, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      timeout: 9000
+    });
+
+    const $ = cheerio.load(data);
+    const out = [];
 
     $("a").each((i, el) => {
       let href = $(el).attr("href");
-      let title = $(el).text().trim() || $(el).attr("title") || "";
+      let title = $(el).text().trim();
 
       if (!href || !title || title.length < 10) return;
 
       if (!href.startsWith("http")) {
         try {
-          href = new URL(href, searchUrl).href;
+          href = new URL(href, url).href;
         } catch {
           return;
         }
       }
 
-      if (!isValidArticle(href)) return;
+      const desc =
+        $(el).closest("article").find("p").first().text().trim() || title;
 
-      const desc = $(el).closest("article").find("p").first().text().trim() || title;
-      const score = scoreResult(href, title, desc, words);
+      let score = 0;
+      words.forEach((w) => {
+        if (title.toLowerCase().includes(w)) score += 10;
+        if (desc.toLowerCase().includes(w)) score += 4;
+        if (href.toLowerCase().includes(w)) score += 2;
+      });
 
-      results.push({
+      out.push({
         site: site.name,
-        category: site.category,
-        region: site.region,
         title,
         description: desc,
         url: href,
@@ -889,44 +823,36 @@ async function scrapeSite(site, query, words) {
       });
     });
 
-    return results;
+    return out;
   } catch {
     return [];
   }
 }
 
 // =============================================================================
-// DEDUPLICATION
+// DEDUPE
 // =============================================================================
 
 function dedupe(list) {
   const map = new Map();
-  for (const it of list) {
-    if (!it || !it.url) continue;
-    const key = it.url.toLowerCase().replace(/\/+$/, "");
-    if (!map.has(key) || (it.score || 0) > (map.get(key).score || 0)) {
-      map.set(key, it);
+
+  list.forEach((r) => {
+    if (!r.url) return;
+    const key = r.url.toLowerCase();
+    if (!map.has(key) || map.get(key).score < r.score) {
+      map.set(key, r);
     }
-  }
-  return Array.from(map.values());
+  });
+
+  return [...map.values()];
 }
 
 // =============================================================================
-// MAIN HANDLER (Next.js / Node-compatible)
-// Query parameters:
-//  - q (required) : search query
-//  - limit (optional): number of results to return (default 20)
-//  - delayMs (optional): delay between summary API calls in ms (default 2000)
-//  - referenceQuery (optional): reference string for merged summary filtering
-//  - useAI (optional): "true" or "false" to enable Claude selection
+// MAIN HANDLER
 // =============================================================================
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-
-  if (req.method === "OPTIONS") return res.status(200).end();
 
   const start = Date.now();
 
@@ -934,83 +860,75 @@ export default async function handler(req, res) {
     const {
       q: query,
       limit = 20,
-      delayMs = 2000,
-      referenceQuery,
-      useAI = "true",
+      referenceQuery = "android16 beta update",
+      useAI = "true"
     } = req.query;
 
-    if (!query) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing required parameter: q (query). Example: ?q=flight%20delays"
-      });
-    }
+    if (!query)
+      return res.status(400).json({ error: "Missing ?q=" });
 
-    // Use referenceQuery when provided, else if not provided, use the specific
-    // user-provided reference (per user request) "android16 beta update"
-    const refQuery = referenceQuery || "android16 beta update";
+    const hash = createHash("md5")
+      .update(query + referenceQuery + limit)
+      .digest("hex");
 
-    const cacheKey = createHash("md5").update(String(query) + String(refQuery) + String(limit)).digest("hex");
-    const cached = CACHE.get(cacheKey);
-    if (cached) {
-      return res.json({ ...cached, cached: true, processingTime: Date.now() - start });
-    }
+    const cached = CACHE.get(hash);
+    if (cached) return res.json(cached);
 
-    // Basic category detection (fallback)
-    const words = makeKeywordsFromQuery(query);
-    // Scrape configured NEWS_SITES (if any) in parallel
-    const scrapePromises = NEWS_SITES.map((site) => scrapeSite(site, query, words));
+    // Build keyword list
+    const words = keywords(query);
+
+    // Scrape NEWS_SITES + DuckDuckGo
+    const scrapePromises = NEWS_SITES.map((site) =>
+      scrapeSite(site, query, words)
+    );
+
     const ddgPromise = searchDuckDuckGo(query);
 
-    const [scrapedLists, ddgResults] = await Promise.all([Promise.all(scrapePromises), ddgPromise]);
+    const [scrapedLists, ddg] = await Promise.all([
+      Promise.all(scrapePromises),
+      ddgPromise
+    ]);
 
-    const combined = [...(scrapedLists.flat ? scrapedLists.flat() : []), ...(ddgResults || [])];
+    const combined = [...scrapedLists.flat(), ...ddg];
     const unique = dedupe(combined);
 
-    unique.sort((a, b) => (b.score || 0) - (a.score || 0));
-    const top = unique.slice(0, Math.max(1, Math.min(unique.length, limit * 2)));
+    unique.sort((a, b) => b.score - a.score);
 
-    // initial bestUrls (top 5)
-    let bestUrls = top.slice(0, 5).map((r) => r.url).filter(Boolean);
+    const top = unique.slice(0, limit * 2);
 
-    // Optionally use Claude to pick best URLs (keeps simple english)
+    let bestUrls = top.slice(0, 5).map((x) => x.url);
+
     if (useAI === "true" && top.length > 0) {
-      const ai = await analyzeWithClaudeSimple(query, top);
-      if (ai && Array.isArray(ai.bestUrls) && ai.bestUrls.length > 0) {
-        bestUrls = ai.bestUrls.slice(0, 8);
+      const ai = await analyzeWithClaude(query, top);
+      if (ai?.bestUrls?.length) {
+        bestUrls = ai.bestUrls.slice(0, 10);
       }
     }
 
-    // Ensure bestUrls are unique and trimmed
-    bestUrls = Array.from(new Set(bestUrls)).slice(0, 12);
+    bestUrls = [...new Set(bestUrls)];
 
-    // Process summaries with configured delay (default 2000ms)
-    const effectiveDelay = Number.isNaN(Number(delayMs)) ? 2000 : parseInt(delayMs, 10);
-    const summaries = await processBestUrls(bestUrls, effectiveDelay);
+    const summaries = await processBestUrls(bestUrls);
+    const mergedSummary = buildMergedSummaryFiltered(
+      summaries,
+      referenceQuery
+    );
 
-    // Build merged summary filtered by referenceQuery (or default)
-    const mergedSummary = buildMergedSummaryFiltered(summaries, refQuery);
-
-    const response = {
+    const output = {
       success: true,
       query,
-      referenceQuery: refQuery,
+      referenceQuery,
       bestUrls,
       summaries,
       mergedSummary,
-      results: top.slice(0, Number(limit)),
+      results: top.slice(0, limit),
       totalResults: unique.length,
       processingTime: Date.now() - start
     };
 
-    // Cache and return
-    CACHE.set(cacheKey, response, DEFAULT_TTL);
+    CACHE.set(hash, output, DEFAULT_TTL);
 
-    return res.json({ ...response, cached: false });
+    res.json(output);
   } catch (err) {
-    return res.status(500).json({
-      success: false,
-      error: String(err.message || err)
-    });
+    res.status(500).json({ success: false, error: err.message });
   }
 }
