@@ -4,7 +4,7 @@ import { createHash } from "crypto";
 import NEWS_SITES from "./news_urls.js";
 
 // ========================================================
-// FASTER AXIOS INSTANCE
+// FAST AXIOS
 // ========================================================
 const http = axios.create({
   timeout: 5000,
@@ -17,53 +17,58 @@ const http = axios.create({
 const CACHE = new Map();
 const CACHE_TTL = 10 * 60 * 1000;
 
-function getCache(k) {
-  const c = CACHE.get(k);
-  if (!c) return null;
-  if (Date.now() - c.time > c.ttl) {
-    CACHE.delete(k);
+function getCache(key) {
+  const entry = CACHE.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.time > entry.ttl) {
+    CACHE.delete(key);
     return null;
   }
-  return c.data;
+  return entry.data;
 }
-function setCache(k, d) {
-  CACHE.set(k, { data: d, ttl: CACHE_TTL, time: Date.now() });
+function setCache(key, data) {
+  CACHE.set(key, { data, time: Date.now(), ttl: CACHE_TTL });
 }
 
 // ========================================================
-// CATEGORY DETECT
+// DELAY HELPER (2 seconds)
+// ========================================================
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// ========================================================
+// CATEGORY DETECTION
 // ========================================================
 async function detectCategory(query) {
   try {
     const prompt = encodeURIComponent(
-      `Category for "${query}". Return ONE WORD: general, technology, business, sports, science, entertainment, health, politics`
+      `Category for "${query}". Reply ONE WORD: general, business, technology, sports, entertainment, health, politics`
     );
     const r = await http.get(`https://text.pollinations.ai/${prompt}`);
-    const c = r.data.trim().toLowerCase();
-    const ok = ["general","technology","business","sports","science","entertainment","health","politics"];
-    return ok.includes(c) ? c : "general";
-  } catch { return "general"; }
+    return r.data.trim().toLowerCase();
+  } catch {
+    return "general";
+  }
 }
 
 // ========================================================
-// POLLINATIONS — BEST URL PICKER
+// POLLINATIONS BEST URL PICK
 // ========================================================
-async function analyzeWithPollinations(query, results) {
+async function analyzeWithPollinations(query, items) {
   try {
-    const reduced = results.slice(0, 10).map((r, i) =>
+    const reduced = items.slice(0, 10).map((r, i) =>
       `${i + 1}. ${r.title}\nURL: ${r.url}`
     ).join("\n\n");
 
     const prompt = encodeURIComponent(`
-Pick the most relevant URLs for "${query}" from below:
+Pick best URLs for query "${query}".
 
 ${reduced}
 
-Return ONLY JSON:
+Return JSON ONLY:
 {"bestUrls":["...","..."],"reasoning":"..."}
     `);
 
-    const r = await http.get(`https://text.pollinations.ai/${prompt}`, { timeout: 8000 });
+    const r = await http.get(`https://text.pollinations.ai/${prompt}`);
     const match = r.data.trim().match(/\{[\s\S]*\}/);
     if (!match) return null;
     return JSON.parse(match[0]);
@@ -73,23 +78,23 @@ Return ONLY JSON:
 }
 
 // ========================================================
-// SCRAPER (FAST MODE)
+// SCRAPER – FAST VERSION
 // ========================================================
 async function scrapeSite(site, query, words) {
   try {
-    const searchUrl = site.url(query);
-    const r = await http.get(searchUrl);
+    const url = site.url(query);
+    const r = await http.get(url);
     const $ = cheerio.load(r.data);
+
     const out = [];
 
     $("a").slice(0, 80).each((i, el) => {
       let href = $(el).attr("href");
-      let title = $(el).text().trim();
+      const title = $(el).text().trim();
       if (!href || !title || title.length < 6) return;
 
       if (!href.startsWith("http")) {
-        try { href = new URL(href, searchUrl).href; }
-        catch { return; }
+        try { href = new URL(href, url).href; } catch { return; }
       }
 
       const score = words.reduce((s, w) => {
@@ -120,34 +125,30 @@ async function scrapeSite(site, query, words) {
 // ========================================================
 function dedupe(list) {
   const map = new Map();
-  for (const item of list) {
-    const key = item.url.toLowerCase();
-    if (!map.has(key) || map.get(key).score < item.score) {
-      map.set(key, item);
+  for (const r of list) {
+    const key = r.url.toLowerCase();
+    if (!map.has(key) || map.get(key).score < r.score) {
+      map.set(key, r);
     }
   }
   return [...map.values()];
 }
 
 // ========================================================
-// FULL ARTICLE SCRAPER
+// ARTICLE SCRAPER
 // ========================================================
 async function fetchFullArticle(url) {
   try {
-    const encoded = encodeURIComponent(url);
-    const apiUrl = `https://reader-zeta-three.vercel.app/api/scrape?url=${encoded}`;
-    const r = await http.get(apiUrl, { timeout: 15000 });
+    const api = `https://reader-zeta-three.vercel.app/api/scrape?url=${encodeURIComponent(url)}`;
+    const r = await http.get(api, { timeout: 15000 });
 
-    if (!r.data?.success)
-      return { url, error: "No content" };
+    if (!r.data?.success) return { url, error: "No article" };
 
     return {
       url,
-      title: r.data.metadata?.title || null,
-      summary: r.data.contentParts?.[0]?.summary || null,
-      fullText: r.data.fullText || null,
-      author: r.data.metadata?.author || null,
-      siteName: r.data.metadata?.siteName || null
+      title: r.data.metadata?.title || "",
+      summary: r.data.contentParts?.[0]?.summary || "",
+      fullText: r.data.fullText?.slice(0, 1500) || "" // limit length
     };
   } catch {
     return { url, error: "Failed" };
@@ -155,34 +156,50 @@ async function fetchFullArticle(url) {
 }
 
 // ========================================================
-// NEW — UNIFIED SUMMARY VIA POLLINATIONS
+// NEW — MAKE POINTS PER ARTICLE (Pollinations)
 // ========================================================
-async function generateUnifiedSummary(bestArticles) {
+async function summarizeArticle(article) {
   try {
-    const text = bestArticles
-      .map(a => `TITLE: ${a.title}\nSUMMARY: ${a.summary}\nCONTENT: ${a.fullText}`)
-      .join("\n\n----------------------\n\n");
-
     const prompt = encodeURIComponent(`
-Create one combined summary from ALL these articles.
+Make 2–3 simple English key points from this article:
 
-Write in **10 simple English points** (1 to 10).
-Each point must be short, clear, and easy to learn.
-Focus on the key facts and learning points.
+TITLE: ${article.title}
+SUMMARY: ${article.summary}
+CONTENT: ${article.fullText}
 
-CONTENT:
-${text}
-
-Return ONLY plain text, no JSON.
+Return only plain text points.
     `);
 
     const r = await http.get(`https://text.pollinations.ai/${prompt}`, {
-      timeout: 15000
+      timeout: 12000
     });
 
     return r.data.trim();
   } catch {
-    return "Summary generation failed.";
+    return "";
+  }
+}
+
+// ========================================================
+// NEW — Final Combine 1–10 Summary
+// ========================================================
+async function makeFinalSummary(allPoints) {
+  try {
+    const prompt = encodeURIComponent(`
+Combine these points into a simple 1–10 summary in basic English:
+
+${allPoints.join("\n")}
+
+Return only 10 bullet points.
+    `);
+
+    const r = await http.get(`https://text.pollinations.ai/${prompt}`, {
+      timeout: 12000
+    });
+
+    return r.data.trim();
+  } catch {
+    return "Summary unavailable.";
   }
 }
 
@@ -191,53 +208,63 @@ Return ONLY plain text, no JSON.
 // ========================================================
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
+
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  const { q, limit = 20, category, region } = req.query;
+  const { q, limit = 20 } = req.query;
   if (!q) return res.status(400).json({ error: "Missing ?q" });
 
   const query = q.trim();
   const words = query.toLowerCase().split(/\s+/);
 
-  const ck = createHash("md5").update(query).digest("hex");
-  const cached = getCache(ck);
+  // CACHE CHECK
+  const hash = createHash("md5").update(query).digest("hex");
+  const cached = getCache(hash);
   if (cached) return res.json({ cached: true, ...cached });
 
-  // Detect category
-  const detected = category || (await detectCategory(query));
+  // CATEGORY
+  const detected = await detectCategory(query);
 
-  // Pick first 12 fast sites
-  let sources = NEWS_SITES.slice(0, 12);
-  if (detected !== "general")
-    sources = sources.filter(s => s.category === detected || s.category === "general");
+  // SCRAPE NEWS
+  const scraped = await Promise.all(
+    NEWS_SITES.slice(0, 12).map(s => scrapeSite(s, query, words))
+  );
 
-  // Scrape fast
-  const scraped = await Promise.all(sources.map(s => scrapeSite(s, query, words)));
   const results = dedupe(scraped.flat()).sort((a, b) => b.score - a.score);
   const top = results.slice(0, limit);
 
-  // AI picks best URLs
+  // AI choose best URLs
   const ai = await analyzeWithPollinations(query, top);
   const bestUrls = ai?.bestUrls || top.slice(0, 4).map(r => r.url);
 
   // Fetch full articles
   const bestArticles = await Promise.all(bestUrls.map(fetchFullArticle));
 
-  // NEW — Generate final unified summary
-  const finalSummary = await generateUnifiedSummary(bestArticles);
+  // ================================================================
+  // NEW — GENERATE POINTS FOR EACH ARTICLE WITH 2 SEC DELAY
+  // ================================================================
+  const allPoints = [];
+
+  for (const article of bestArticles) {
+    const p = await summarizeArticle(article);
+    allPoints.push(p);
+
+    await wait(2000); // 2 sec delay
+  }
+
+  // FINAL 1–10 SUMMARY
+  const unifiedSummary = await makeFinalSummary(allPoints);
 
   const output = {
     success: true,
     query,
     detectedCategory: detected,
-    totalResults: results.length,
     results: top,
     bestUrls,
     bestArticles,
-    unifiedSummary: finalSummary,
-    aiReasoning: ai?.reasoning || null
+    unifiedSummary
   };
 
-  setCache(ck, output);
+  setCache(hash, output);
   res.json(output);
 }
