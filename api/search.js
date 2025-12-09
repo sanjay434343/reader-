@@ -1,3 +1,5 @@
+// api/search.js - Vercel Serverless Function
+
 import axios from "axios";
 import * as cheerio from "cheerio";
 import { createHash } from "crypto";
@@ -37,11 +39,11 @@ class LRUCache {
 
 const CACHE = new LRUCache(150);
 const DEFAULT_TTL = 600 * 1000;
+const SCRAPE_API = "https://reader-zeta-three.vercel.app/api/scrape?url=";
 
 // =============================================================================
-// COMPREHENSIVE WORLDWIDE NEWS SOURCES
+// NEWS SITES (Keep your existing NEWS_SITES array)
 // =============================================================================
-
 
 const NEWS_SITES = [
   // === GENERAL NEWS - INDIA (50 sources) ===
@@ -558,8 +560,80 @@ const NEWS_SITES = [
   { name: "InStyle", url: q => `https://www.instyle.com/search?q=${q}`, category: "lifestyle", region: "USA" },
   { name: "Who What Wear", url: q => `https://www.whowhatwear.com/search?q=${q}`, category: "lifestyle", region: "USA" }
 ];
+
 // =============================================================================
-// CLAUDE AI INTEGRATION FOR INTELLIGENT URL SELECTION
+// SCRAPE AND SUMMARIZE ARTICLES
+// =============================================================================
+
+async function scrapeAndSummarize(url) {
+  try {
+    // Step 1: Scrape the article
+    const scrapeResponse = await axios.get(`${SCRAPE_API}${encodeURIComponent(url)}`, {
+      timeout: 15000
+    });
+
+    if (!scrapeResponse.data.success) {
+      return null;
+    }
+
+    const articleData = scrapeResponse.data;
+
+    // Step 2: Generate AI summary
+    const summaryResponse = await axios.post(
+      "https://api.anthropic.com/v1/messages",
+      {
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1500,
+        messages: [
+          {
+            role: "user",
+            content: `Analyze this article and create a structured summary.
+
+Title: ${articleData.title || 'Untitled'}
+Content: ${articleData.content?.substring(0, 4000) || articleData.text?.substring(0, 4000) || ''}
+
+Return ONLY a JSON object with:
+- "title": engaging article title
+- "summary": array of 3-10 key points (each point should be a complete sentence highlighting important information)
+- "publishDate": extracted date if found, or null
+- "source": news source name extracted from content
+- "category": article category (technology/business/sports/entertainment/health/science/politics/general)
+- "tags": array of 3-5 relevant tags
+
+Make summary points informative and capture the essence of the article. Only return valid JSON, no markdown.`
+          }
+        ]
+      },
+      {
+        headers: {
+          "Content-Type": "application/json"
+        },
+        timeout: 15000
+      }
+    );
+
+    const aiText = summaryResponse.data.content
+      .filter(block => block.type === "text")
+      .map(block => block.text)
+      .join("");
+    
+    const cleanJson = aiText.replace(/```json\n?|```\n?/g, "").trim();
+    const summary = JSON.parse(cleanJson);
+
+    return {
+      url,
+      originalTitle: articleData.title,
+      ...summary,
+      wordCount: articleData.content?.split(/\s+/).length || 0
+    };
+  } catch (error) {
+    console.error(`Failed to process ${url}:`, error.message);
+    return null;
+  }
+}
+
+// =============================================================================
+// CLAUDE AI INTEGRATION FOR URL SELECTION
 // =============================================================================
 
 async function analyzeWithClaude(query, results) {
@@ -578,21 +652,14 @@ async function analyzeWithClaude(query, results) {
         messages: [
           {
             role: "user",
-            content: `Analyze these search results for the query: "${query}"
+            content: `Analyze these search results for: "${query}"
 
 ${resultsText}
 
 Return ONLY a JSON object with:
-1. "bestUrls": array of 3-5 most relevant, authoritative, and recent URLs
-2. "reasoning": brief explanation of why these URLs are best
-3. "category": most appropriate category (technology/business/science/sports/entertainment/health/politics/general)
-
-Consider:
-- Source credibility and authority
-- Content relevance to query
-- Recency indicators
-- Article depth and quality
-- Diverse perspectives
+1. "bestUrls": array of 5-10 most relevant URLs (prioritize authoritative sources and recent content)
+2. "reasoning": brief explanation
+3. "category": most appropriate category
 
 Respond ONLY with valid JSON, no markdown.`
           }
@@ -612,9 +679,7 @@ Respond ONLY with valid JSON, no markdown.`
       .join("");
     
     const cleanJson = aiText.replace(/```json\n?|```\n?/g, "").trim();
-    const analysis = JSON.parse(cleanJson);
-    
-    return analysis;
+    return JSON.parse(cleanJson);
   } catch (error) {
     console.error("Claude AI analysis failed:", error.message);
     return null;
@@ -622,7 +687,7 @@ Respond ONLY with valid JSON, no markdown.`
 }
 
 // =============================================================================
-// FALLBACK AI USING POLLINATIONS
+// CATEGORY DETECTION
 // =============================================================================
 
 async function detectCategory(query) {
@@ -645,59 +710,7 @@ async function detectCategory(query) {
 }
 
 // =============================================================================
-// DIRECT WEB SEARCH USING DUCKDUCKGO API
-// =============================================================================
-
-async function searchDuckDuckGo(query) {
-  try {
-    const response = await axios.get(`https://api.duckduckgo.com/`, {
-      params: {
-        q: query,
-        format: 'json',
-        no_html: 1,
-        skip_disambig: 1
-      },
-      timeout: 5000
-    });
-    
-    const results = [];
-    
-    if (response.data.AbstractURL) {
-      results.push({
-        site: "DuckDuckGo",
-        category: "general",
-        title: response.data.Heading || query,
-        description: response.data.AbstractText || "",
-        url: response.data.AbstractURL,
-        score: 100,
-        region: "Global"
-      });
-    }
-    
-    if (response.data.RelatedTopics) {
-      response.data.RelatedTopics.forEach(topic => {
-        if (topic.FirstURL && topic.Text) {
-          results.push({
-            site: "DuckDuckGo",
-            category: "general",
-            title: topic.Text.substring(0, 200),
-            description: topic.Text,
-            url: topic.FirstURL,
-            score: 80,
-            region: "Global"
-          });
-        }
-      });
-    }
-    
-    return results;
-  } catch {
-    return [];
-  }
-}
-
-// =============================================================================
-// SMART URL VALIDATION
+// URL VALIDATION
 // =============================================================================
 
 function isValidArticle(url) {
@@ -714,7 +727,7 @@ function isValidArticle(url) {
 }
 
 // =============================================================================
-// ADVANCED SCORING ALGORITHM
+// SCORING ALGORITHM
 // =============================================================================
 
 function scoreResult(url, title, description, queryWords) {
@@ -723,33 +736,24 @@ function scoreResult(url, title, description, queryWords) {
   
   queryWords.forEach(word => {
     const wordLower = word.toLowerCase();
-    
-    // Title scoring (highest weight)
     if (title.toLowerCase().includes(wordLower)) score += 10;
     if (title.toLowerCase().startsWith(wordLower)) score += 15;
-    
-    // Description scoring (medium weight)
     if (description.toLowerCase().includes(wordLower)) score += 5;
-    
-    // URL scoring (low weight)
     if (url.toLowerCase().includes(wordLower)) score += 3;
   });
   
-  // Boost recent articles
   if (/202[4-5]|today|hours ago|minutes ago|yesterday/i.test(text)) score += 8;
   
-  // Boost authoritative sources
   const authoritativeDomains = ["bbc", "reuters", "cnn", "nytimes", "guardian", "nature", "science"];
   if (authoritativeDomains.some(domain => url.includes(domain))) score += 12;
   
-  // Penalize very short titles
   if (title.length < 30) score -= 5;
   
   return Math.max(0, score);
 }
 
 // =============================================================================
-// SCRAPE INDIVIDUAL NEWS SITE
+// SCRAPE SITE
 // =============================================================================
 
 async function scrapeSite(site, query, queryWords) {
@@ -758,8 +762,7 @@ async function scrapeSite(site, query, queryWords) {
     const response = await axios.get(searchUrl, {
       headers: { 
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5"
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
       },
       timeout: 8000,
       maxRedirects: 3
@@ -771,7 +774,7 @@ async function scrapeSite(site, query, queryWords) {
     $("a").each((i, el) => {
       const $el = $(el);
       let href = $el.attr("href");
-      let title = $el.text().trim() || $el.attr("title") || $el.attr("aria-label") || "";
+      let title = $el.text().trim() || $el.attr("title") || "";
       
       let description = $el.closest("article, .article, .story, .post, .item")
         .find("p, .description, .excerpt, .summary")
@@ -810,38 +813,24 @@ async function scrapeSite(site, query, queryWords) {
 }
 
 // =============================================================================
-// SMART DEDUPLICATION
+// DEDUPLICATION
 // =============================================================================
 
 function deduplicateResults(results) {
   const urlMap = new Map();
-  const titleMap = new Map();
   
   results.forEach(result => {
     const urlKey = result.url.toLowerCase().replace(/\/$/, "");
-    const titleKey = result.title.toLowerCase().trim();
-    
     if (!urlMap.has(urlKey) || urlMap.get(urlKey).score < result.score) {
       urlMap.set(urlKey, result);
     }
-    
-    if (!titleMap.has(titleKey) || titleMap.get(titleKey).score < result.score) {
-      titleMap.set(titleKey, result);
-    }
   });
   
-  const merged = new Map();
-  [...urlMap.values(), ...titleMap.values()].forEach(result => {
-    if (!merged.has(result.url) || merged.get(result.url).score < result.score) {
-      merged.set(result.url, result);
-    }
-  });
-  
-  return Array.from(merged.values());
+  return Array.from(urlMap.values());
 }
 
 // =============================================================================
-// MAIN SEARCH HANDLER WITH CLAUDE AI ENHANCEMENT
+// MAIN HANDLER
 // =============================================================================
 
 export default async function handler(req, res) {
@@ -856,7 +845,7 @@ export default async function handler(req, res) {
   try {
     const { 
       q: query, 
-      limit = 20, 
+      limit = 5,
       category: userCategory,
       region: userRegion,
       useAI = "true" 
@@ -865,12 +854,12 @@ export default async function handler(req, res) {
     if (!query) {
       return res.status(400).json({ 
         error: "Query parameter 'q' is required",
-        usage: "?q=<search_term>&limit=<number>&category=<optional>&region=<optional>&useAI=<true|false>"
+        usage: "?q=<search_term>&limit=<number>&category=<optional>&region=<optional>"
       });
     }
     
     // Check cache
-    const cacheKey = `search:${createHash("md5").update(query + userCategory + userRegion).digest("hex")}`;
+    const cacheKey = `search:${createHash("md5").update(query + limit).digest("hex")}`;
     const cached = CACHE.get(cacheKey);
     
     if (cached) {
@@ -882,85 +871,64 @@ export default async function handler(req, res) {
       });
     }
     
-    // AI category detection (parallel)
-    const categoryPromise = userCategory ? Promise.resolve(userCategory) : detectCategory(query);
-    
+    // Detect category
+    const detectedCategory = userCategory || await detectCategory(query);
     const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
     
-    // Get category
-    const detectedCategory = await categoryPromise;
-    
-    // Filter sites by category and region
+    // Filter sites
     let filteredSites = NEWS_SITES;
-    
     if (detectedCategory && detectedCategory !== "general") {
       filteredSites = filteredSites.filter(
         site => site.category === detectedCategory || site.category === "general"
       );
     }
-    
     if (userRegion) {
       filteredSites = filteredSites.filter(
         site => site.region === userRegion || site.region === "Global"
       );
     }
     
-    // Parallel scraping + DuckDuckGo search
-    const scrapingPromises = filteredSites.map(site => 
+    // Scrape sites in parallel
+    const scrapingPromises = filteredSites.slice(0, 30).map(site => 
       scrapeSite(site, query, queryWords)
     );
     
-    const duckDuckGoPromise = searchDuckDuckGo(query);
+    const scrapedResults = await Promise.all(scrapingPromises);
+    const allResults = scrapedResults.flat();
     
-    const [scrapedResults, ddgResults] = await Promise.all([
-      Promise.all(scrapingPromises),
-      duckDuckGoPromise
-    ]);
-    
-    const allResults = [...scrapedResults.flat(), ...ddgResults];
-    
-    // Deduplicate
+    // Deduplicate and sort
     const uniqueResults = deduplicateResults(allResults);
-    
-    // Sort by score
     uniqueResults.sort((a, b) => b.score - a.score);
     
-    // Get top results
-    const topResults = uniqueResults.slice(0, parseInt(limit) * 2);
+    const topResults = uniqueResults.slice(0, 20);
     
-    // AI-powered URL selection (if enabled)
-    let bestUrls = topResults.slice(0, 5).map(r => r.url);
+    // Get best URLs using AI
+    let bestUrls = topResults.slice(0, parseInt(limit)).map(r => r.url);
     let aiReasoning = null;
-    let aiCategory = detectedCategory;
     
     if (useAI === "true" && topResults.length > 0) {
       const aiAnalysis = await analyzeWithClaude(query, topResults);
-      
       if (aiAnalysis) {
-        bestUrls = aiAnalysis.bestUrls || bestUrls;
+        bestUrls = aiAnalysis.bestUrls.slice(0, parseInt(limit));
         aiReasoning = aiAnalysis.reasoning;
-        aiCategory = aiAnalysis.category || detectedCategory;
       }
     }
     
-    // Filter top results to match limit
-    const finalResults = topResults.slice(0, parseInt(limit));
+    // Scrape and summarize articles in parallel
+    const articlePromises = bestUrls.map(url => scrapeAndSummarize(url));
+    const articles = await Promise.all(articlePromises);
+    const validArticles = articles.filter(a => a !== null);
     
     const response = {
       success: true,
       cached: false,
       query,
-      detectedCategory: aiCategory,
-      totalResults: uniqueResults.length,
-      topResults: finalResults.length,
-      bestUrls,
+      category: detectedCategory,
+      totalFound: uniqueResults.length,
+      articlesReturned: validArticles.length,
       aiReasoning,
-      results: finalResults,
-      processingTime: Date.now() - startTime,
-      sources: {
-        traditional: scrapedResults.flat().length,
-        duckduckgo: ddgResults.length
-      }
+      articles: validArticles,
+      processingTime: Date.now() - startTime
     };
     
     // Cache response
