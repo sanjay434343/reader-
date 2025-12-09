@@ -15,13 +15,11 @@ class LRUCache {
   get(key) {
     if (!this.cache.has(key)) return null;
     const entry = this.cache.get(key);
-
     if (Date.now() - entry.timestamp > entry.ttl) {
       this.cache.delete(key);
       return null;
     }
-
-    this.cache.delete(key);
+    this.cache.delete(key); 
     this.cache.set(key, entry);
     return entry.data;
   }
@@ -38,8 +36,9 @@ class LRUCache {
 const CACHE = new LRUCache(150);
 const DEFAULT_TTL = 600000;
 
+
 // =============================================================================
-// EMPTY NEWS_SITES BLOCK (Your full site list goes here later)
+// EMPTY NEWS_SITES BLOCK (User will fill this later)
 // =============================================================================
 
 const NEWS_SITES = [
@@ -558,40 +557,39 @@ const NEWS_SITES = [
   { name: "Who What Wear", url: q => `https://www.whowhatwear.com/search?q=${q}`, category: "lifestyle", region: "USA" }
 ];
 
+
 // =============================================================================
 // UTILS
 // =============================================================================
 
-function delay(ms) {
-  return new Promise((res) => setTimeout(res, ms));
-}
+function delay(ms) { return new Promise(res => setTimeout(res, ms)); }
 
-function cleanText(str) {
-  return String(str || "").replace(/\s+/g, " ").trim();
+function cleanText(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
 }
 
 function splitSentences(text) {
   return cleanText(text)
     .split(/(?<=[.?!])\s+/)
-    .filter((s) => s.length > 30);
+    .filter((t) => t.length > 30);
 }
 
-function keywords(q) {
-  return q
+function keywords(query) {
+  return query
     .toLowerCase()
     .split(" ")
     .map((w) => w.replace(/[^a-z0-9]/g, ""))
     .filter((w) => w.length > 2);
 }
 
+
 // =============================================================================
-// SCRAPER + SUMMARY USING YOUR SCRAPE API
+// ARTICLE SCRAPER (Uses your reader-zeta-three API)
 // =============================================================================
 
 async function summarizeArticle(url) {
   try {
     const api = `https://reader-zeta-three.vercel.app/api/scrape?url=${encodeURIComponent(url)}`;
-
     const { data } = await axios.get(api, { timeout: 15000 });
 
     const title =
@@ -608,11 +606,7 @@ async function summarizeArticle(url) {
 
     const sentences = splitSentences(full);
 
-    return {
-      url,
-      title,
-      summary: sentences.slice(0, 4)
-    };
+    return { url, title, summary: sentences.slice(0, 4) };
   } catch (err) {
     return {
       url,
@@ -622,26 +616,27 @@ async function summarizeArticle(url) {
   }
 }
 
+
 // =============================================================================
 // PROCESS bestUrls WITH 2 SECOND DELAY
 // =============================================================================
 
 async function processBestUrls(bestUrls) {
-  const output = [];
+  const list = [];
   const DELAY_MS = 2000;
 
-  for (const url of bestUrls) {
-    const s = await summarizeArticle(url);
-    output.push(s);
-
+  for (const link of bestUrls) {
+    const s = await summarizeArticle(link);
+    list.push(s);
     await delay(DELAY_MS);
   }
 
-  return output;
+  return list;
 }
 
+
 // =============================================================================
-// MERGED SUMMARY FILTERED BY referenceQuery
+// MERGED SUMMARY USING referenceQuery (keyword match)
 // =============================================================================
 
 function buildMergedSummaryFiltered(summaries, referenceQuery) {
@@ -649,8 +644,8 @@ function buildMergedSummaryFiltered(summaries, referenceQuery) {
   const lines = [];
 
   summaries.forEach((item) => {
-    item.summary.forEach((sentence) => {
-      const t = cleanText(sentence);
+    item.summary.forEach((s) => {
+      const t = cleanText(s);
       if (keys.some((k) => t.toLowerCase().includes(k))) {
         lines.push(t);
       }
@@ -658,97 +653,68 @@ function buildMergedSummaryFiltered(summaries, referenceQuery) {
   });
 
   const normalized = lines
-    .map((s) => s.replace(/[^a-zA-Z0-9 ,.]/g, "").trim())
-    .filter((s) => s.length > 20);
+    .map((x) => x.replace(/[^a-zA-Z0-9 ,.]/g, "").trim())
+    .filter((x) => x.length > 20);
 
-  if (normalized.length === 0) {
-    return ["No merged summary found for this topic"];
-  }
-
-  return normalized.slice(0, 10);
+  return normalized.length ? normalized.slice(0, 10) : ["No relevant summary found"];
 }
 
-// =============================================================================
-// CLAUDE AI RANKER — SIMPLE BASIC ENGLISH (5–8 POINTS)
-// =============================================================================
 
-async function analyzeWithClaude(query, results) {
+// =============================================================================
+// POLLINATIONS AI – FREE ALTERNATIVE TO CLAUDE
+// =============================================================================
+// Pollinations returns plain text, we instruct it to output valid JSON only.
+
+async function pollinationsRanker(query, results) {
   try {
-    const top = results.slice(0, 12);
+    const resultBlock = results
+      .slice(0, 12)
+      .map((r, i) => `${i + 1}. ${r.title} | ${r.url} | score ${r.score}`)
+      .join("\n");
 
-    const block = top
-      .map((r, i) => `${i + 1}. ${r.title}\n${r.url}\nScore: ${r.score}`)
-      .join("\n\n");
-
-    const resp = await axios.post(
-      "https://api.anthropic.com/v1/messages",
-      {
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 800,
-        system: `
-Use simple English.
-Write only 5 to 8 short points.
-No special characters.
-Return clean JSON only.
-`,
-        messages: [
-          {
-            role: "user",
-            content: `
-Analyze these results:
-
-${block}
-
-Return JSON:
+    const prompt = `
+Use simple English. No special characters.
+Pick 3–6 URLs that match the query: "${query}".
+Return JSON only like:
 {
-  "bestUrls": [],
-  "reasoning": "",
-  "category": ""
+  "bestUrls": ["url1","url2"],
+  "reasoning": "short simple english"
 }
-`
-          }
-        ]
-      },
-      {
-        headers: { "Content-Type": "application/json" },
-        timeout: 15000
-      }
-    );
 
-    const txt = resp.data.content
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("")
+Here are the results:
+${resultBlock}
+    `;
+
+    const apiUrl = `https://text.pollinations.ai/${encodeURIComponent(prompt)}`;
+    const { data } = await axios.get(apiUrl, { timeout: 10000 });
+
+    const cleaned = String(data)
       .replace(/```json|```/g, "")
       .trim();
 
-    return JSON.parse(txt);
-  } catch {
+    return JSON.parse(cleaned);
+  } catch (err) {
     return null;
   }
 }
 
+
 // =============================================================================
-// DUCKDUCKGO FALLBACK
+// DUCKDUCKGO FALLBACK SEARCH
 // =============================================================================
 
 async function searchDuckDuckGo(query) {
   try {
     const r = await axios.get("https://api.duckduckgo.com/", {
-      params: {
-        q: query,
-        format: "json",
-        no_html: 1,
-        skip_disambig: 1
-      },
-      timeout: 8000
+      params: { q: query, format: "json", skip_disambig: 1, no_html: 1 },
+      timeout: 9000
     });
 
     const out = [];
 
     if (r.data.AbstractURL) {
       out.push({
-        site: "DuckDuckGo",
+        site: "DDG",
         title: r.data.Heading,
         description: r.data.AbstractText,
         url: r.data.AbstractURL,
@@ -759,11 +725,11 @@ async function searchDuckDuckGo(query) {
     (r.data.RelatedTopics || []).forEach((t) => {
       if (t.FirstURL && t.Text) {
         out.push({
-          site: "DuckDuckGo",
+          site: "DDG",
           title: t.Text,
           description: t.Text,
           url: t.FirstURL,
-          score: 50
+          score: 40
         });
       }
     });
@@ -774,14 +740,14 @@ async function searchDuckDuckGo(query) {
   }
 }
 
+
 // =============================================================================
-// SIMPLE WEBSITE SCRAPER (NEWS_SITES entries use this)
+// BASIC SITE SCRAPER (Only used if NEWS_SITES is populated)
 // =============================================================================
 
 async function scrapeSite(site, query, words) {
   try {
     const url = site.url(query);
-
     const { data } = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       timeout: 9000
@@ -790,11 +756,13 @@ async function scrapeSite(site, query, words) {
     const $ = cheerio.load(data);
     const out = [];
 
-    $("a").each((i, el) => {
+    $("a").each((_, el) => {
       let href = $(el).attr("href");
       let title = $(el).text().trim();
 
-      if (!href || !title || title.length < 10) return;
+      if (!href || !title || title.length < 8) return;
+
+      if (href.includes("yahoo.com")) return;
 
       if (!href.startsWith("http")) {
         try {
@@ -810,17 +778,10 @@ async function scrapeSite(site, query, words) {
       let score = 0;
       words.forEach((w) => {
         if (title.toLowerCase().includes(w)) score += 10;
-        if (desc.toLowerCase().includes(w)) score += 4;
-        if (href.toLowerCase().includes(w)) score += 2;
+        if (desc.toLowerCase().includes(w)) score += 5;
       });
 
-      out.push({
-        site: site.name,
-        title,
-        description: desc,
-        url: href,
-        score
-      });
+      out.push({ site: site.name, title, description: desc, url: href, score });
     });
 
     return out;
@@ -829,23 +790,23 @@ async function scrapeSite(site, query, words) {
   }
 }
 
+
 // =============================================================================
 // DEDUPE
 // =============================================================================
 
 function dedupe(list) {
   const map = new Map();
-
-  list.forEach((r) => {
-    if (!r.url) return;
-    const key = r.url.toLowerCase();
-    if (!map.has(key) || map.get(key).score < r.score) {
-      map.set(key, r);
+  list.forEach((item) => {
+    if (!item.url) return;
+    const key = item.url.toLowerCase();
+    if (!map.has(key) || map.get(key).score < item.score) {
+      map.set(key, item);
     }
   });
-
   return [...map.values()];
 }
+
 
 // =============================================================================
 // MAIN HANDLER
@@ -853,8 +814,6 @@ function dedupe(list) {
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-
-  const start = Date.now();
 
   try {
     const {
@@ -867,29 +826,24 @@ export default async function handler(req, res) {
     if (!query)
       return res.status(400).json({ error: "Missing ?q=" });
 
-    const hash = createHash("md5")
+    const cacheKey = createHash("md5")
       .update(query + referenceQuery + limit)
       .digest("hex");
 
-    const cached = CACHE.get(hash);
+    const cached = CACHE.get(cacheKey);
     if (cached) return res.json(cached);
 
-    // Build keyword list
     const words = keywords(query);
 
-    // Scrape NEWS_SITES + DuckDuckGo
-    const scrapePromises = NEWS_SITES.map((site) =>
-      scrapeSite(site, query, words)
-    );
-
+    const scrapePromises = NEWS_SITES.map((s) => scrapeSite(s, query, words));
     const ddgPromise = searchDuckDuckGo(query);
 
-    const [scrapedLists, ddg] = await Promise.all([
+    const [scraped, ddg] = await Promise.all([
       Promise.all(scrapePromises),
       ddgPromise
     ]);
 
-    const combined = [...scrapedLists.flat(), ...ddg];
+    const combined = [...scraped.flat(), ...ddg];
     const unique = dedupe(combined);
 
     unique.sort((a, b) => b.score - a.score);
@@ -898,11 +852,10 @@ export default async function handler(req, res) {
 
     let bestUrls = top.slice(0, 5).map((x) => x.url);
 
+    // POLLINATIONS AI RANKING
     if (useAI === "true" && top.length > 0) {
-      const ai = await analyzeWithClaude(query, top);
-      if (ai?.bestUrls?.length) {
-        bestUrls = ai.bestUrls.slice(0, 10);
-      }
+      const ai = await pollinationsRanker(query, top);
+      if (ai?.bestUrls?.length) bestUrls = ai.bestUrls;
     }
 
     bestUrls = [...new Set(bestUrls)];
@@ -921,11 +874,10 @@ export default async function handler(req, res) {
       summaries,
       mergedSummary,
       results: top.slice(0, limit),
-      totalResults: unique.length,
-      processingTime: Date.now() - start
+      totalResults: unique.length
     };
 
-    CACHE.set(hash, output, DEFAULT_TTL);
+    CACHE.set(cacheKey, output, DEFAULT_TTL);
 
     res.json(output);
   } catch (err) {
