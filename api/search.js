@@ -4,34 +4,31 @@ import * as cheerio from "cheerio";
 import { createHash } from "crypto";
 
 /**
- * Vercel serverless endpoint: /api/search?q=...
+ * /api/search?q=...&limit=...&category=...&categories=...
  *
- * Behavior:
- * - detect category via Pollinations
+ * Behavior summary:
+ * - detect category via Pollinations (unless supplied)
  * - scrape a selection of news sites (fast)
- * - create ranked results
- * - pick best urls (Pollinations + fallback)
+ * - produce ranked results
+ * - ask Pollinations to pick best URLs
  * - for each best url: fetch reader API -> get fullText -> chunk (~5000 chars) ->
  *   summarize each chunk via Pollinations
- * - merge chunk summaries via Pollinations to produce:
- *    - merged short summary
- *    - 10-point simple-English learning list (1..10)
- * - return minimal output:
- *    { success, query, detectedCategory, results: [{title,url}], unifiedSummary, timeMs }
+ * - merge chunk summaries via Pollinations to produce a merged summary and a
+ *   list of points (min 5). The API returns only the brief results and the list.
  *
- * Notes:
- * - Adds a 2000ms (2 second) delay between processing each article (sequential)
- * - Keep API keys none (we call free pollinations endpoints). If you use a paid LLM,
- *   replace analyzeWithPollinations/summarizeWithPollinations/mergeSummaries with your calls.
+ * No API keys required; uses free Pollinations endpoints (text.pollinations.ai) and
+ * reader-zeta-three.vercel.app reader endpoint provided by you.
  */
 
 // -------------------- Config --------------------
-const CHUNK_SIZE = 5000; // Option B: medium ~5000 chars
+const CHUNK_SIZE = 5000;
 const FETCH_TIMEOUT = 12000;
-const POLLINATIONS_TIMEOUT = 12000;
+const POLLINATIONS_TIMEOUT = 15000;
 const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
-const MAX_SITES = 12; // limit sites for speed
+const MAX_SITES = 18;
 const MAX_RESULTS = 20;
+const ARTICLE_PROCESS_DELAY_MS = 2000; // 2s between articles
+const CHUNK_SUMMARY_DELAY_MS = 250;
 
 // -------------------- Simple in-memory cache --------------------
 const CACHE = new Map();
@@ -59,7 +56,7 @@ const pollinationsHttp = axios.create({
   headers: { "User-Agent": "PollinationsClient/1.0" }
 });
 
-// -------------------- NEWS SITES (trimmed large list; you can expand) --------------------
+// -------------------- NEWS SITES (trimmed list) --------------------
 const NEWS_SITES = [
   // === GENERAL NEWS - INDIA (50 sources) ===
   { name: "Indian Express", url: q => `https://indianexpress.com/?s=${q}`, category: "general", region: "India" },
@@ -578,19 +575,15 @@ const NEWS_SITES = [
 
 // -------------------- Utilities --------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 function hashKey(s) {
   return createHash("md5").update(s).digest("hex");
 }
-
 function isLikelyValidUrl(u) {
   if (!u) return false;
   const lower = u.toLowerCase();
   const blacklist = ["facebook", "twitter", "instagram", "pinterest", "x.com", "mailto:"];
   return !blacklist.some(b => lower.includes(b));
 }
-
-// simple score engine
 function computeScore(title = "", desc = "", url = "", words = []) {
   const text = `${title} ${desc} ${url}`.toLowerCase();
   let s = 0;
@@ -603,8 +596,6 @@ function computeScore(title = "", desc = "", url = "", words = []) {
   if (/\b(202\d|today|hours ago|minutes ago)\b/.test(text)) s += 6;
   return s;
 }
-
-// chunk long text into ~CHUNK_SIZE character pieces
 function chunkText(text, chunkSize = CHUNK_SIZE) {
   if (!text) return [];
   const normalized = text.replace(/\s+/g, " ").trim();
@@ -612,7 +603,6 @@ function chunkText(text, chunkSize = CHUNK_SIZE) {
   let i = 0;
   while (i < normalized.length) {
     const slice = normalized.slice(i, i + chunkSize);
-    // attempt to not cut mid-sentence: extend to next sentence end (.) up to +200 chars
     let end = slice.length;
     const remainder = normalized.slice(i + slice.length, i + slice.length + 200);
     const dotIdx = remainder.indexOf(".");
@@ -622,11 +612,19 @@ function chunkText(text, chunkSize = CHUNK_SIZE) {
   }
   return chunks;
 }
+function dedupe(items) {
+  const m = new Map();
+  for (const it of items) {
+    const k = (it.url || "").toLowerCase();
+    if (!k) continue;
+    if (!m.has(k) || (m.get(k).score || 0) < (it.score || 0)) {
+      m.set(k, it);
+    }
+  }
+  return Array.from(m.values());
+}
 
 // -------------------- Pollinations helpers --------------------
-// Pollinations endpoints are free text-get endpoints; we send prompts encoded in the URL.
-// Each function expects JSON fallback when parsing responses.
-
 async function detectCategoryPollinations(query) {
   try {
     const prompt = encodeURIComponent(`Return ONE WORD category for query: "${query}". Choose from: general, technology, business, sports, science, entertainment, health, politics.`);
@@ -641,7 +639,7 @@ async function detectCategoryPollinations(query) {
 
 async function analyzeWithPollinations(query, items /* [{title,url}] */) {
   try {
-    const reduced = items.slice(0, 10).map((r, i) => `${i+1}. ${r.title}\nURL: ${r.url}`).join("\n\n");
+    const reduced = items.slice(0, 12).map((r, i) => `${i+1}. ${r.title}\nURL: ${r.url}`).join("\n\n");
     const prompt = encodeURIComponent(`
 Analyze the following search results for the query: "${query}"
 
@@ -664,9 +662,7 @@ Return JSON ONLY:
 }
 
 async function summarizeWithPollinations(instruction, text) {
-  // instruction: brief instruction e.g., "Summarize this chunk in 2-3 sentences."
   try {
-    // limit chunk length in prompt to avoid huge URL; we pass only first ~8000 chars
     const snippet = String(text).slice(0, 14000);
     const prompt = encodeURIComponent(`
 ${instruction}
@@ -688,21 +684,31 @@ Return JSON ONLY:
   }
 }
 
+/**
+ * mergeSummariesPollinations:
+ * - asks Pollinations to return a merged short summary AND an array "points".
+ * - instructs minimum 5 points (explicit).
+ * - If Pollinations returns fewer than 5, we'll augment later.
+ */
 async function mergeSummariesPollinations(query, chunkSummaries) {
   try {
     const joined = chunkSummaries.map((s,i)=>`${i+1}. ${s}`).join("\n\n");
     const prompt = encodeURIComponent(`
 You are given multiple short summaries (numbered) for articles related to: "${query}".
 
-1) Produce a concise merged summary (max 3 short paragraphs).
-2) Produce a 10-point list (1 to 10) in simple English of the most important learning points or facts derived from the merged summary. Each point should be one short sentence.
+Task:
+1) Produce a concise merged summary (2-3 short paragraphs maximum).
+2) Produce a list called "points" containing key factual bullets derived from the merged summary.
+   - Each point must be a short sentence (no paragraphs).
+   - Minimum 5 points. If there are many facts, you may include more than 5.
+   - Do NOT include any introductory or trailing text; return JSON ONLY.
 
-Return JSON ONLY:
+Return JSON ONLY in this exact structure:
 {
   "mergedSummary": "...",
-  "tenPoints": ["p1","p2", "...", "p10"]
+  "points": ["p1","p2", "..."]
 }
-    
+
 Summaries:
 ${joined}
 `);
@@ -724,8 +730,7 @@ async function scrapeSiteForLinks(site, query, words) {
     const $ = cheerio.load(resp.data || "");
     const out = [];
 
-    // iterate anchors — limited slice for speed
-    $("a").slice(0, 120).each((i, el) => {
+    $("a").slice(0, 160).each((i, el) => {
       let href = $(el).attr("href");
       let title = $(el).text().trim();
 
@@ -738,7 +743,6 @@ async function scrapeSiteForLinks(site, query, words) {
       if (!isLikelyValidUrl(href)) return;
 
       const desc = $(el).closest("article").find("p").first().text().trim() || title;
-
       const score = computeScore(title, desc, href, words);
 
       out.push({
@@ -758,7 +762,7 @@ async function scrapeSiteForLinks(site, query, words) {
   }
 }
 
-// -------------------- Reader fetch --------------------
+// -------------------- Reader fetch (uses your reader endpoint) --------------------
 async function fetchArticleViaReader(url) {
   try {
     const encoded = encodeURIComponent(url);
@@ -781,43 +785,41 @@ async function fetchArticleViaReader(url) {
   }
 }
 
-// -------------------- Dedupe --------------------
-function dedupe(items) {
-  const m = new Map();
-  for (const it of items) {
-    const k = (it.url || "").toLowerCase();
-    if (!k) continue;
-    if (!m.has(k) || (m.get(k).score || 0) < (it.score || 0)) {
-      m.set(k, it);
-    }
-  }
-  return Array.from(m.values());
-}
-
 // -------------------- Main handler --------------------
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   if (req.method === "OPTIONS") return res.status(200).end();
 
   const startTime = Date.now();
-  const q = (req.query.q || req.query.q || "").toString().trim();
+  const q = (req.query.q || req.query.query || "").toString().trim();
   const limit = Math.min(Number(req.query.limit || MAX_RESULTS), MAX_RESULTS);
 
   if (!q) return res.status(400).json({ error: "Missing ?q query param" });
 
-  const cacheKey = hashKey(q);
+  const cacheKey = hashKey(`${q}|${String(req.query.category||"")}|${String(req.query.categories||"")}|${limit}`);
   const cached = getCache(cacheKey);
   if (cached) return res.json({ cached: true, ...cached });
 
-  // detect category
-  const detectedCategory = (req.query.category) ? req.query.category : await detectCategoryPollinations(q);
+  // determine requested categories (optional)
+  let requestedCategories = null; // null means auto-detect
+  if (req.query.categories) {
+    requestedCategories = req.query.categories.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  } else if (req.query.category) {
+    requestedCategories = [req.query.category.toString().trim().toLowerCase()];
+  }
 
-  // choose sources: slice for speed
+  // detect category if none provided
+  const detectedCategory = requestedCategories && requestedCategories.length ? requestedCategories[0] : await detectCategoryPollinations(q);
+
+  // choose sources: slice for speed and filter by requested categories (if any)
   let sources = NEWS_SITES.slice(0, MAX_SITES);
-  if (detectedCategory && detectedCategory !== "general") {
+  if (requestedCategories && requestedCategories.length) {
+    sources = sources.filter(s => requestedCategories.includes(s.category) || s.category === "general");
+  } else if (detectedCategory && detectedCategory !== "general") {
     sources = sources.filter(s => s.category === detectedCategory || s.category === "general");
   }
 
+  // words for scoring
   const words = q.toLowerCase().split(/\s+/).filter(Boolean);
 
   // scrape in parallel
@@ -825,45 +827,38 @@ export default async function handler(req, res) {
   const scrapedArrays = await Promise.all(scrapePromises);
   const flat = scrapedArrays.flat();
   const deduped = dedupe(flat).sort((a,b) => (b.score||0) - (a.score||0));
-  const topResults = deduped.slice(0, Math.max(limit, 20)); // keep at least 20 for AI selection
+  const topResults = deduped.slice(0, Math.max(limit, 20));
 
-  // Prepare lightweight results for UI (title + url)
+  // lightweight UI results (title + url)
   const uiResults = topResults.map(r => ({ title: r.title, url: r.url }));
 
-  // Ask Pollinations to pick best URLs (fast)
+  // Ask Pollinations to pick best URLs
   let bestUrls = [];
   try {
     const aiPick = await analyzeWithPollinations(q, uiResults);
     if (aiPick && Array.isArray(aiPick.bestUrls) && aiPick.bestUrls.length) {
-      // keep only URLs that appear in our detected list (safety)
       const setAvailable = new Set(uiResults.map(r => r.url));
       bestUrls = aiPick.bestUrls.filter(u => setAvailable.has(u)).slice(0, 6);
     }
   } catch {}
-  // fallback: top 4 direct
   if (!bestUrls || bestUrls.length === 0) {
     bestUrls = uiResults.slice(0, 4).map(r => r.url);
   }
 
-  // Process each best URL sequentially with 2s delay between each processing
+  // Process best URLs sequentially
   const processedArticles = [];
   for (let i = 0; i < bestUrls.length; i++) {
     const url = bestUrls[i];
-    // fetch via reader
     const article = await fetchArticleViaReader(url);
     if (article && article.fullText) {
-      // chunk
       const chunks = chunkText(article.fullText, CHUNK_SIZE);
-      // summarize each chunk sequentially (we keep sequential to avoid pollinations rate issues)
       const chunkSummaries = [];
       for (let j = 0; j < chunks.length; j++) {
         const chunk = chunks[j];
-        // instruction: short summary for each chunk
         const instruction = "Summarize the following article chunk in 2-3 short sentences, focusing on the key facts.";
         const s = await summarizeWithPollinations(instruction, chunk);
         chunkSummaries.push(s || (chunk.slice(0, 200) + (chunk.length>200 ? "..." : "")));
-        // small delay between chunk summaries to be polite (250ms)
-        await sleep(250);
+        await sleep(CHUNK_SUMMARY_DELAY_MS);
       }
       processedArticles.push({
         url: article.url,
@@ -879,12 +874,11 @@ export default async function handler(req, res) {
         error: article?.error || "no-content"
       });
     }
-    // 2 second delay between each article processing (user requested)
-    if (i < bestUrls.length - 1) await sleep(2000);
+    if (i < bestUrls.length - 1) await sleep(ARTICLE_PROCESS_DELAY_MS);
   }
 
-  // Combine all chunk summaries across articles into a single merged summary using Pollinations
-  const allChunkSummaries = processedArticles.flatMap(a => a.chunkSummaries || []);
+  // Merge all chunk summaries across articles
+  const allChunkSummaries = processedArticles.flatMap(a => a.chunkSummaries || []).filter(Boolean);
   let merged = null;
   if (allChunkSummaries.length) {
     try {
@@ -894,48 +888,82 @@ export default async function handler(req, res) {
     }
   }
 
-  // Final unifiedSummary: prefer tenPoints array (10 point simple english). Fallback to mergedSummary or short constructed summary.
-  let unifiedSummary = null;
-  if (merged && merged.tenPoints && Array.isArray(merged.tenPoints) && merged.tenPoints.length >= 1) {
-    unifiedSummary = {
-      mergedSummary: merged.mergedSummary || null,
-      tenPoints: merged.tenPoints.slice(0, 10)
-    };
-  } else if (merged && merged.mergedSummary) {
-    // try to produce 10 short points by splitting sentences (fallback)
-    const sentences = (merged.mergedSummary || "").split(/(?<=[.!?])\s+/).filter(Boolean);
-    const ten = [];
-    for (let i=0;i<10;i++) {
-      ten.push(sentences[i] ? sentences[i].replace(/\s+/g," ").trim() : "");
-    }
-    unifiedSummary = {
-      mergedSummary: merged.mergedSummary,
-      tenPoints: ten
-    };
-  } else {
-    // last-resort fallback: synthesize simple list from available chunk summaries (first 10)
-    const shortPoints = allChunkSummaries.slice(0, 10).map((s, idx) => {
-      const one = (""+s).replace(/\s+/g," ").trim();
-      const sent = one.split(/(?<=[.!?])\s+/)[0] || one.slice(0,100);
-      return `${idx+1}. ${sent}`;
-    });
-    unifiedSummary = {
-      mergedSummary: (allChunkSummaries.slice(0,3).join("\n\n")) || "No merged summary available.",
-      tenPoints: shortPoints.length ? shortPoints : ["No key points available."]
-    };
+  // Ensure finalPoints is an array of short bullets, minimum 5 items
+  let finalPoints = [];
+  if (merged && Array.isArray(merged.points) && merged.points.length >= 1) {
+    // sanitize points
+    finalPoints = merged.points.map(p => (""+p).replace(/\s+/g," ").trim()).filter(Boolean);
   }
 
-  // Build minimal UI response per Option 3
+  // If Pollinations returned insufficient points (<5) attempt to synthesize more
+  if (finalPoints.length < 5) {
+    // Candidate sources for extra bullets: merged.mergedSummary, chunk summaries first sentences
+    const extras = [];
+
+    if (merged && merged.mergedSummary) {
+      const sents = (merged.mergedSummary || "").split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
+      extras.push(...sents);
+    }
+
+    // from chunk summaries, first sentence of each
+    for (const cs of allChunkSummaries) {
+      const sent = (""+cs).split(/(?<=[.!?])\s+/)[0];
+      if (sent) extras.push(sent.trim());
+    }
+
+    // dedupe and add until we have 5
+    const added = new Set(finalPoints.map(p => p.toLowerCase()));
+    for (const e of extras) {
+      const normalized = e.replace(/\s+/g," ").trim();
+      if (!normalized) continue;
+      const low = normalized.toLowerCase();
+      if (added.has(low)) continue;
+      finalPoints.push(normalized);
+      added.add(low);
+      if (finalPoints.length >= 5) break;
+    }
+
+    // if still short, use short fragments from top results titles
+    if (finalPoints.length < 5) {
+      for (const r of uiResults.slice(0, 10)) {
+        const t = (r.title || "").split(/[-|:—]/)[0].trim();
+        if (!t) continue;
+        const low = t.toLowerCase();
+        if (finalPoints.map(p=>p.toLowerCase()).includes(low)) continue;
+        finalPoints.push(t);
+        if (finalPoints.length >= 5) break;
+      }
+    }
+  }
+
+  // Final cleanup: ensure every point is short; strip trailing spaces
+  finalPoints = finalPoints.map((p,i) => {
+    let txt = (""+p).trim();
+    // if the point doesn't start with a number, add a number prefix (optional). Keep it as plain bullets (no numbers) per user preference:
+    // We'll return bare bullets (no numeric prefix) so the consumer can render as needed.
+    // Trim to 240 chars max
+    if (txt.length > 240) txt = txt.slice(0,237) + "...";
+    return txt;
+  }).filter(Boolean);
+
+  // Ensure minimum 5 items (last-resort fill)
+  while (finalPoints.length < 5) finalPoints.push("Detail unavailable.");
+
+  // Build minimal response
   const response = {
     success: true,
     query: q,
     detectedCategory,
+    // results provided for UI: title + url (no article bodies)
     results: uiResults.slice(0, limit).map(r => ({ title: r.title, url: r.url })),
-    unifiedSummary, // { mergedSummary, tenPoints: [...] }
+    unifiedSummary: {
+      // include mergedSummary only for debug/consumers; primary contract is `points` array of bullets
+      mergedSummary: merged?.mergedSummary || null,
+      points: finalPoints
+    },
     timeMs: Date.now() - startTime
   };
 
-  // cache and return
   setCache(cacheKey, response);
   return res.json(response);
 }
