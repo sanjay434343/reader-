@@ -4,7 +4,7 @@ import { createHash } from "crypto";
 import NEWS_SITES from "./news_urls.js";
 
 // ============================================================================
-// SERVERLESS CACHE (resets on cold start)
+// SERVERLESS CACHE (cold start resets it)
 // ============================================================================
 
 const CACHE = new Map();
@@ -18,6 +18,7 @@ function getCache(key) {
     CACHE.delete(key);
     return null;
   }
+
   return entry.data;
 }
 
@@ -32,23 +33,17 @@ function setCache(key, data, ttl = CACHE_TTL) {
 async function detectCategory(query) {
   try {
     const prompt = encodeURIComponent(
-      `Return ONE WORD category for query: "${query}". Options: general, technology, business, sports, science, entertainment, health, politics.`
+      `Return ONE WORD category for query: "${query}": general, technology, business, sports, science, entertainment, health, politics.`
     );
 
     const res = await axios.get(`https://text.pollinations.ai/${prompt}`, {
-      timeout: 8000,
+      timeout: 7000,
     });
 
     const out = res.data.trim().toLowerCase();
     const valid = [
-      "general",
-      "technology",
-      "business",
-      "sports",
-      "science",
-      "entertainment",
-      "health",
-      "politics",
+      "general", "technology", "business", "sports",
+      "science", "entertainment", "health", "politics",
     ];
 
     return valid.includes(out) ? out : "general";
@@ -72,12 +67,10 @@ Analyze these news results for: "${query}"
 
 ${formatted}
 
-Pick the MOST relevant URLs.
-
-Return JSON ONLY:
+Return STRICT JSON ONLY:
 {
-  "bestUrls": ["url1","url2","url3"],
-  "reasoning": "short explanation"
+  "bestUrls": ["url1","url2", ...],
+  "reasoning": "Why these URLs were selected"
 }
     `);
 
@@ -96,7 +89,7 @@ Return JSON ONLY:
 }
 
 // ============================================================================
-// SCRAPE EACH NEWS WEBSITE
+// SCRAPER PER SITE
 // ============================================================================
 
 async function scrapeSite(site, query, words) {
@@ -109,7 +102,7 @@ async function scrapeSite(site, query, words) {
     });
 
     const $ = cheerio.load(res.data);
-    const out = [];
+    const results = [];
 
     $("a").each((i, el) => {
       let url = $(el).attr("href");
@@ -135,7 +128,7 @@ async function scrapeSite(site, query, words) {
         return s;
       }, 0);
 
-      out.push({
+      results.push({
         site: site.name,
         category: site.category,
         region: site.region,
@@ -146,60 +139,51 @@ async function scrapeSite(site, query, words) {
       });
     });
 
-    return out;
+    return results;
   } catch {
     return [];
   }
 }
 
 // ============================================================================
-// DEDUPE RESULTS
+// DEDUPLICATION
 // ============================================================================
 
-function dedupe(list) {
+function dedupe(arr) {
   const map = new Map();
-
-  for (const r of list) {
+  arr.forEach((r) => {
     const key = r.url.toLowerCase();
     if (!map.has(key) || map.get(key).score < r.score) {
       map.set(key, r);
     }
-  }
+  });
   return [...map.values()];
 }
 
 // ============================================================================
-// FETCH FULL ARTICLE ONE BY ONE
+// FETCH FULL ARTICLE USING reader-zeta API
 // ============================================================================
 
 async function fetchFullArticle(url) {
   try {
     const encoded = encodeURIComponent(url);
-    const apiUrl = `https://reader-zeta-three.vercel.app/api/scrape?url=${encoded}`;
+    const endpoint = `https://reader-zeta-three.vercel.app/api/scrape?url=${encoded}`;
 
-    const res = await axios.get(apiUrl, { timeout: 15000 });
+    const res = await axios.get(endpoint, { timeout: 12000 });
 
-    if (!res.data?.success) {
-      return {
-        url,
-        error: "Cannot fetch article"
-      };
-    }
+    if (!res.data.success) return null;
 
     return {
       url,
       title: res.data.metadata?.title || null,
       description: res.data.metadata?.description || null,
-      author: res.data.metadata?.author || null,
-      siteName: res.data.metadata?.siteName || null,
       fullText: res.data.fullText || null,
       summary: res.data.contentParts?.[0]?.summary || null,
+      author: res.data.metadata?.author || null,
+      siteName: res.data.metadata?.siteName || null,
     };
   } catch {
-    return {
-      url,
-      error: "Fetch failed"
-    };
+    return null;
   }
 }
 
@@ -213,20 +197,18 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
 
   const { q, limit = 20, category, region } = req.query;
-
   if (!q) return res.status(400).json({ error: "Missing ?q=" });
 
   const query = q.trim();
   const words = query.toLowerCase().split(/\s+/);
 
   const cacheKey = createHash("md5").update(query).digest("hex");
-  const cached = getCache(cacheKey);
 
+  const cached = getCache(cacheKey);
   if (cached) return res.json({ cached: true, ...cached });
 
   const detected = category || (await detectCategory(query));
 
-  // Filter news sources
   let sources = NEWS_SITES;
   if (detected !== "general") {
     sources = sources.filter(
@@ -240,28 +222,20 @@ export default async function handler(req, res) {
     );
   }
 
-  // SCRAPE ALL SITES
-  const scrapeJobs = sources.map((s) => scrapeSite(s, query, words));
+  // STEP 1 — Scrape all sites
+  const scrapeJobs = sources.map((site) => scrapeSite(site, query, words));
   const scraped = await Promise.all(scrapeJobs);
 
   const results = dedupe(scraped.flat()).sort((a, b) => b.score - a.score);
 
   const top = results.slice(0, limit);
 
-  // AI SELECT BEST URLS
+  // STEP 2 — Pollinations "best URL" AI ranking
   const ai = await analyzeWithPollinations(query, top);
   const bestUrls = ai?.bestUrls || top.slice(0, 5).map((r) => r.url);
 
-  // FETCH FULL ARTICLES ONE BY ONE
-  const bestArticles = [];
-
-  for (let i = 0; i < bestUrls.length; i++) {
-    const article = await fetchFullArticle(bestUrls[i]);
-    bestArticles.push({
-      index: i + 1,
-      ...article,
-    });
-  }
+  // STEP 3 — Fetch full articles for each best URL
+  const fullArticles = await Promise.all(bestUrls.map((u) => fetchFullArticle(u)));
 
   const response = {
     success: true,
@@ -270,9 +244,9 @@ export default async function handler(req, res) {
     totalResults: results.length,
     results: top,
     bestUrls,
-    bestArticles,
+    bestArticles: fullArticles.filter(Boolean),
     aiReasoning: ai?.reasoning || null,
-    timeMs: Date.now() - (req.startTime || Date.now()),
+    timeMs: Date.now() - Number(req.headers["x-vercel-start-time"] || Date.now()),
   };
 
   setCache(cacheKey, response);
