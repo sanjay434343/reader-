@@ -1,102 +1,32 @@
-// api/search.js
-
 import axios from "axios";
 import * as cheerio from "cheerio";
 import { createHash } from "crypto";
-import NEWS_SITES from "./news_urls.js";   // <-- Correct import
+import NEWS_SITES from "./news_urls.js";
 
-// =============================================================================
-// LRU CACHE IMPLEMENTATION
-// =============================================================================
+// ============================================================================
+// LIGHTWEIGHT SERVERLESS CACHE (RESET ON EVERY COLD START)
+// ============================================================================
 
-class LRUCache {
-  constructor(maxSize = 100) {
-    this.cache = new Map();
-    this.maxSize = maxSize;
-  }
+const CACHE = new Map();
+const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
-  get(key) {
-    if (!this.cache.has(key)) return null;
-    const entry = this.cache.get(key);
-
-    if (Date.now() - entry.timestamp > entry.ttl) {
-      this.cache.delete(key);
-      return null;
-    }
-
-    this.cache.delete(key);
-    this.cache.set(key, entry);
-    return entry.data;
-  }
-
-  set(key, data, ttl) {
-    if (this.cache.size >= this.maxSize) {
-      const firstKey = this.cache.keys().next().value;
-      this.cache.delete(firstKey);
-    }
-    this.cache.set(key, { data, ttl, timestamp: Date.now() });
-  }
-}
-
-const CACHE = new LRUCache(150);
-const DEFAULT_TTL = 600 * 1000;
-
-// =============================================================================
-// CLAUDE AI ANALYSIS
-// =============================================================================
-
-async function analyzeWithClaude(query, results) {
-  try {
-    const topResults = results.slice(0, 15);
-
-    const resultsText = topResults.map((r, i) =>
-      `${i + 1}. [${r.site}] ${r.title}\n   URL: ${r.url}\n   Score: ${r.score}`
-    ).join("\n\n");
-
-    const response = await axios.post(
-      "https://api.anthropic.com/v1/messages",
-      {
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        messages: [
-          {
-            role: "user",
-            content: `
-Analyze these search results for: "${query}"
-
-${resultsText}
-
-Return ONLY JSON:
-{
-  "bestUrls": [ ... ],
-  "reasoning": "...",
-  "category": "..."
-}
-`
-          }
-        ]
-      },
-      {
-        headers: { "Content-Type": "application/json" },
-        timeout: 10000
-      }
-    );
-
-    const aiText = response.data.content
-      .filter(b => b.type === "text")
-      .map(b => b.text)
-      .join("");
-
-    const cleanJson = aiText.replace(/```json|```/g, "").trim();
-    return JSON.parse(cleanJson);
-  } catch {
+function getCache(key) {
+  const item = CACHE.get(key);
+  if (!item) return null;
+  if (Date.now() - item.time > item.ttl) {
+    CACHE.delete(key);
     return null;
   }
+  return item.data;
 }
 
-// =============================================================================
-// FALLBACK CATEGORY DETECTION
-// =============================================================================
+function setCache(key, data, ttl = CACHE_TTL) {
+  CACHE.set(key, { data, ttl, time: Date.now() });
+}
+
+// ============================================================================
+// CATEGORY DETECTION FALLBACK
+// ============================================================================
 
 async function detectCategory(query) {
   try {
@@ -104,24 +34,33 @@ async function detectCategory(query) {
       `Return only ONE WORD category for query: "${query}". Choose from: general, technology, business, sports, science, entertainment, health, politics.`
     );
 
-    const response = await axios.get(
-      `https://text.pollinations.ai/${prompt}`,
-      { timeout: 5000 }
-    );
+    const response = await axios.get(`https://text.pollinations.ai/${prompt}`, {
+      timeout: 5000
+    });
 
-    const category = response.data.toLowerCase().trim();
-    const valid = ["general", "technology", "business", "sports", "science", "entertainment", "health", "politics"];
-    return valid.includes(category) ? category : "general";
+    const value = response.data.trim().toLowerCase();
+    const valid = [
+      "general",
+      "technology",
+      "business",
+      "sports",
+      "science",
+      "entertainment",
+      "health",
+      "politics"
+    ];
+
+    return valid.includes(value) ? value : "general";
   } catch {
     return "general";
   }
 }
 
-// =============================================================================
-// DUCKDUCKGO SEARCH
-// =============================================================================
+// ============================================================================
+// DUCKDUCKGO API RESULT SOURCE
+// ============================================================================
 
-async function searchDuckDuckGo(query) {
+async function duckSearch(query) {
   try {
     const response = await axios.get("https://api.duckduckgo.com/", {
       params: {
@@ -133,10 +72,10 @@ async function searchDuckDuckGo(query) {
       timeout: 5000
     });
 
-    const results = [];
+    const out = [];
 
     if (response.data.AbstractURL) {
-      results.push({
+      out.push({
         site: "DuckDuckGo",
         category: "general",
         title: response.data.Heading || query,
@@ -150,10 +89,10 @@ async function searchDuckDuckGo(query) {
     if (response.data.RelatedTopics) {
       response.data.RelatedTopics.forEach(t => {
         if (t.FirstURL && t.Text) {
-          results.push({
+          out.push({
             site: "DuckDuckGo",
             category: "general",
-            title: t.Text.substring(0, 200),
+            title: t.Text,
             description: t.Text,
             url: t.FirstURL,
             score: 80,
@@ -163,79 +102,75 @@ async function searchDuckDuckGo(query) {
       });
     }
 
-    return results;
+    return out;
   } catch {
     return [];
   }
 }
 
-// =============================================================================
-// URL VALIDATION
-// =============================================================================
+// ============================================================================
+// URL FILTER
+// ============================================================================
 
-function isValidArticle(url) {
+function isValidUrl(url) {
   if (!url) return false;
-
-  const badPatterns = [
-    "facebook", "twitter", "instagram", "pinterest", "x.com",
-    "mailto:", "login", "signup", "share", "tag/", "topic/"
-  ];
-
-  return !badPatterns.some(p => url.toLowerCase().includes(p));
+  const bad = ["facebook", "twitter", "instagram", "pinterest", "x.com", "mailto:"];
+  return !bad.some(b => url.toLowerCase().includes(b));
 }
 
-// =============================================================================
-// SCORING ALGORITHM
-// =============================================================================
+// ============================================================================
+// SCORE ENGINE
+// ============================================================================
 
-function scoreResult(url, title, desc, queryWords) {
+function score(url, title, desc, words) {
   const text = `${title} ${desc} ${url}`.toLowerCase();
-  let score = 0;
-
-  queryWords.forEach(word => {
-    if (title.toLowerCase().includes(word)) score += 10;
-    if (desc.toLowerCase().includes(word)) score += 5;
-    if (url.toLowerCase().includes(word)) score += 3;
+  let s = 0;
+  words.forEach(w => {
+    if (title.toLowerCase().includes(w)) s += 10;
+    if (desc.toLowerCase().includes(w)) s += 5;
+    if (url.toLowerCase().includes(w)) s += 3;
   });
-
-  if (/202[4-5]|today|hours ago|minutes ago|yesterday/.test(text)) score += 8;
-
-  return score;
+  if (/202|today|hours ago|minutes ago/.test(text)) s += 8;
+  return s;
 }
 
-// =============================================================================
-// SCRAPE A NEWS SITE
-// =============================================================================
+// ============================================================================
+// SCRAPER FOR EACH NEWS SOURCE
+// ============================================================================
 
-async function scrapeSite(site, query, queryWords) {
+async function scrapeSite(site, query, words) {
   try {
-    const searchUrl = site.url(query);
-    const response = await axios.get(searchUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-      },
-      timeout: 8000
+    const base = site.url(query);
+
+    const response = await axios.get(base, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      timeout: 6000
     });
 
     const $ = cheerio.load(response.data);
+
     const results = [];
 
     $("a").each((i, el) => {
-      let href = $(el).attr("href");
+      let url = $(el).attr("href");
       let title = $(el).text().trim();
 
-      if (!href || !title || title.length < 10) return;
+      if (!url || !title || title.length < 10) return;
 
-      if (!href.startsWith("http")) {
-        try { href = new URL(href, searchUrl).href; }
-        catch { return; }
+      // absolute URL fix
+      if (!url.startsWith("http")) {
+        try {
+          url = new URL(url, base).href;
+        } catch {
+          return;
+        }
       }
 
-      if (!isValidArticle(href)) return;
+      if (!isValidUrl(url)) return;
 
       const description =
-        $(el).closest("article").find("p").first().text().trim().substring(0, 200)
-        || title;
+        $(el).closest("article").find("p").first().text().trim() ||
+        title.substring(0, 200);
 
       results.push({
         site: site.name,
@@ -243,8 +178,8 @@ async function scrapeSite(site, query, queryWords) {
         region: site.region,
         title,
         description,
-        url: href,
-        score: scoreResult(href, title, description, queryWords)
+        url,
+        score: score(url, title, description, words)
       });
     });
 
@@ -254,84 +189,77 @@ async function scrapeSite(site, query, queryWords) {
   }
 }
 
-// =============================================================================
-// REMOVE DUPLICATES
-// =============================================================================
+// ============================================================================
+// DEDUPLICATION
+// ============================================================================
 
-function deduplicate(arr) {
+function dedupe(list) {
   const map = new Map();
-  arr.forEach(r => {
+  list.forEach(r => {
     const key = r.url.toLowerCase();
     if (!map.has(key) || map.get(key).score < r.score) {
       map.set(key, r);
     }
   });
-  return Array.from(map.values());
+  return [...map.values()];
 }
 
-// =============================================================================
-// MAIN HANDLER
-// =============================================================================
+// ============================================================================
+// SERVERLESS API HANDLER
+// ============================================================================
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   if (req.method === "OPTIONS") return res.status(200).end();
 
   const start = Date.now();
-  const { q: query, limit = 20, category: userCategory, region } = req.query;
+  const { q, limit = 20, category, region } = req.query;
 
-  if (!query) {
-    return res.status(400).json({ error: "Missing ?q query" });
-  }
+  if (!q) return res.status(400).json({ error: "Missing ?q query param" });
 
-  // Check cache
-  const cacheKey = createHash("md5").update(query + userCategory + region).digest("hex");
-  const cached = CACHE.get(cacheKey);
+  const query = q.trim();
+  const cacheKey = createHash("md5").update(query + category + region).digest("hex");
+
+  const cached = getCache(cacheKey);
   if (cached) {
     return res.json({ cached: true, ...cached });
   }
 
-  const detectedCategory = userCategory || await detectCategory(query);
+  const detected = category || (await detectCategory(query));
   const queryWords = query.toLowerCase().split(/\s+/);
 
-  let filteredSites = NEWS_SITES;
+  // filter news sources
+  let sources = NEWS_SITES;
 
-  if (detectedCategory !== "general") {
-    filteredSites = filteredSites.filter(
-      s => s.category === detectedCategory || s.category === "general"
-    );
+  if (detected !== "general") {
+    sources = sources.filter(s => s.category === detected || s.category === "general");
   }
 
   if (region) {
-    filteredSites = filteredSites.filter(
-      s => s.region === region || s.region === "Global"
-    );
+    sources = sources.filter(s => s.region === region || s.region === "Global");
   }
 
-  // scrape
-  const scrapePromises = filteredSites.map(site => scrapeSite(site, query, queryWords));
-  const duckPromise = searchDuckDuckGo(query);
+  // parallel scraping
+  const scrapeJobs = sources.map(s => scrapeSite(s, query, queryWords));
+  const [scrapedResults, duck] = await Promise.all([
+    Promise.all(scrapeJobs),
+    duckSearch(query)
+  ]);
 
-  const [scraped, ddg] = await Promise.all([Promise.all(scrapePromises), duckPromise]);
-
-  const results = deduplicate([...scraped.flat(), ...ddg])
-    .sort((a, b) => b.score - a.score);
-
-  const topResults = results.slice(0, limit);
-
-  const ai = await analyzeWithClaude(query, topResults);
+  const combined = dedupe([...scrapedResults.flat(), ...duck])
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
 
   const response = {
     success: true,
     query,
-    detectedCategory: ai?.category || detectedCategory,
-    totalResults: results.length,
-    results: topResults,
-    bestUrls: ai?.bestUrls || topResults.slice(0, 5).map(r => r.url),
-    aiReasoning: ai?.reasoning || null,
+    detectedCategory: detected,
+    totalResults: combined.length,
+    results: combined,
     timeMs: Date.now() - start
   };
 
-  CACHE.set(cacheKey, response, DEFAULT_TTL);
+  setCache(cacheKey, response);
+
   res.json(response);
 }
