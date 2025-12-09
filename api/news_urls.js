@@ -514,4 +514,4 @@ const NEWS_SITES = [
   { name: "Who What Wear", url: q => `https://www.whowhatwear.com/search?q=${q}`, category: "lifestyle", region: "USA" }
 ];
 
-module.exports = NEWS_SITES;
+export default NEWS_SITES;
