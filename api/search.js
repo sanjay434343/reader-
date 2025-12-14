@@ -1,124 +1,287 @@
-// api/search.js
-import Parser from "rss-parser";
 import axios from "axios";
+import * as cheerio from "cheerio";
 import { createHash } from "crypto";
 
-const parser = new Parser();
-const POLLINATIONS_TIMEOUT = 15000;
-const CACHE_TTL = 10 * 60 * 1000;
-const MAX_RESULTS = 20;
-const N_FULL = 2;
+/* ============================================================
+   LRU CACHE (SERVERLESS SAFE)
+============================================================ */
 
-/* ================= CACHE ================= */
-const CACHE = new Map();
-const getCache = k => {
-  const v = CACHE.get(k);
-  if (!v) return null;
-  if (Date.now() - v.time > v.ttl) {
-    CACHE.delete(k);
-    return null;
+class LRUCache {
+  constructor(maxSize = 100) {
+    this.cache = new Map();
+    this.maxSize = maxSize;
   }
-  return v.data;
-};
-const setCache = (k, d, ttl = CACHE_TTL) =>
-  CACHE.set(k, { data: d, time: Date.now(), ttl });
-
-const hashKey = s => createHash("md5").update(s).digest("hex");
-
-/* ================= POLLINATIONS ================= */
-const pollinations = axios.create({
-  timeout: POLLINATIONS_TIMEOUT
-});
-
-async function summarizeWithPollinations(text) {
-  const prompt = encodeURIComponent(`
-Summarize the following news content into 2 short factual sentences.
-
-Text:
-${text}
-
-Return JSON ONLY:
-{"summary":"..."}
-`);
-  const r = await pollinations.get(`https://text.pollinations.ai/${prompt}`);
-  const m = String(r.data || "").match(/\{[\s\S]*\}/);
-  return m ? JSON.parse(m[0]).summary : null;
+  get(key) {
+    if (!this.cache.has(key)) return null;
+    const e = this.cache.get(key);
+    if (Date.now() - e.timestamp > e.ttl) {
+      this.cache.delete(key);
+      return null;
+    }
+    this.cache.delete(key);
+    this.cache.set(key, e);
+    return e.data;
+  }
+  set(key, data, ttl) {
+    if (this.cache.size >= this.maxSize) {
+      this.cache.delete(this.cache.keys().next().value);
+    }
+    this.cache.set(key, { data, ttl, timestamp: Date.now() });
+  }
 }
 
-async function mergeSummaries(query, summaries) {
-  const joined = summaries.map((s, i) => `${i + 1}. ${s}`).join("\n");
-  const prompt = encodeURIComponent(`
-Merge the following summaries about "${query}".
+const CACHE = new LRUCache(100);
+const DEFAULT_TTL = 10 * 60 * 1000;
 
-Return JSON ONLY:
-{
-  "mergedSummary": "...",
-  "points": ["p1","p2","p3","p4","p5"]
+/* ============================================================
+   HELPERS
+============================================================ */
+
+const hash = txt =>
+  createHash("md5").update(txt).digest("hex").slice(0, 16);
+
+/* ============================================================
+   GOOGLE NEWS URL RESOLVER
+============================================================ */
+
+async function resolveGoogleNewsUrl(url) {
+  if (!url.includes("news.google.com")) return url;
+
+  try {
+    const res = await axios.get(url, {
+      timeout: 12000,
+      maxRedirects: 5,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+      }
+    });
+
+    const $ = cheerio.load(res.data || "");
+
+    const canonical =
+      $('link[rel="canonical"]').attr("href") ||
+      $('meta[property="og:url"]').attr("content");
+
+    if (canonical?.startsWith("http")) return canonical;
+
+    const refresh = $('meta[http-equiv="refresh"]').attr("content");
+    if (refresh) {
+      const m = refresh.match(/url=(.*)/i);
+      if (m?.[1]) return m[1].trim();
+    }
+
+    let fallback;
+    $("a").each((_, el) => {
+      const h = $(el).attr("href");
+      if (h && h.startsWith("http") && !h.includes("google")) {
+        fallback = h;
+        return false;
+      }
+    });
+
+    return fallback || url;
+  } catch {
+    return url;
+  }
 }
 
-Summaries:
-${joined}
-`);
-  const r = await pollinations.get(`https://text.pollinations.ai/${prompt}`);
-  const m = String(r.data || "").match(/\{[\s\S]*\}/);
-  return m ? JSON.parse(m[0]) : null;
+/* ============================================================
+   CIRCUIT BREAKER
+============================================================ */
+
+class CircuitBreaker {
+  constructor(limit = 5, timeout = 60000) {
+    this.failures = 0;
+    this.limit = limit;
+    this.timeout = timeout;
+    this.state = "CLOSED";
+    this.nextTry = 0;
+  }
+
+  async exec(fn) {
+    if (this.state === "OPEN" && Date.now() < this.nextTry) {
+      throw new Error("Circuit breaker open");
+    }
+    try {
+      const r = await fn();
+      this.failures = 0;
+      this.state = "CLOSED";
+      return r;
+    } catch (e) {
+      this.failures++;
+      if (this.failures >= this.limit) {
+        this.state = "OPEN";
+        this.nextTry = Date.now() + this.timeout;
+      }
+      throw e;
+    }
+  }
 }
 
-/* ================= MAIN HANDLER ================= */
+const breaker = new CircuitBreaker();
+
+/* ============================================================
+   CONTENT EXTRACTION + CLEANING
+============================================================ */
+
+class FullContentExtractor {
+  constructor($) {
+    this.$ = $;
+  }
+
+  extractText() {
+    const $ = this.$;
+
+    [
+      "script","style","noscript","header","footer","nav","aside",
+      "form",".ads",".promo",".share",".comment",".sidebar"
+    ].forEach(s => $(s).remove());
+
+    const priority = [
+      "article","main","[role='main']",
+      ".article-content",".story-content",".entry-content",
+      ".post-content",".article-body"
+    ];
+
+    for (const s of priority) {
+      const el = $(s);
+      if (el.length && el.text().length > 300) {
+        return el.text().trim();
+      }
+    }
+
+    const ps = [];
+    $("p").each((_, el) => {
+      const t = $(el).text().trim();
+      if (t.length > 25) ps.push(t);
+    });
+
+    return ps.join(" ");
+  }
+
+  metadata() {
+    const $ = this.$;
+    return {
+      title:
+        $('meta[property="og:title"]').attr("content") ||
+        $("title").text() ||
+        $("h1").first().text() ||
+        "",
+      description:
+        $('meta[property="og:description"]').attr("content") ||
+        $('meta[name="description"]').attr("content") ||
+        "",
+      author:
+        $('meta[name="author"]').attr("content") ||
+        "",
+      publishDate:
+        $('meta[property="article:published_time"]').attr("content") ||
+        "",
+      siteName:
+        $('meta[property="og:site_name"]').attr("content") ||
+        ""
+    };
+  }
+}
+
+function cleanText(text) {
+  return text
+    .replace(/\s+/g, " ")
+    .replace(/ADVERTISEMENT|Subscribe|Related Articles/gi, "")
+    .trim();
+}
+
+/* ============================================================
+   MEDIA EXTRACTION
+============================================================ */
+
+function extractImages($, baseUrl) {
+  const images = [];
+  const seen = new Set();
+
+  $("img").each((_, el) => {
+    let src = $(el).attr("src") || $(el).attr("data-src");
+    if (!src) return;
+
+    try {
+      src = new URL(src, baseUrl).href;
+      if (!seen.has(src)) {
+        seen.add(src);
+        images.push({ src, alt: $(el).attr("alt") || "" });
+      }
+    } catch {}
+  });
+
+  return images;
+}
+
+/* ============================================================
+   SERVERLESS HANDLER (VERCEL)
+============================================================ */
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
   if (req.method === "OPTIONS") return res.status(200).end();
 
   const start = Date.now();
-  const q = String(req.query.q || "").trim();
-  const limit = Math.min(Number(req.query.limit || MAX_RESULTS), MAX_RESULTS);
+  const { url } = req.query;
 
-  if (!q) return res.status(400).json({ error: "Missing ?q parameter" });
-
-  const cacheKey = hashKey(`rss|${q}|${limit}`);
-  const cached = getCache(cacheKey);
-  if (cached) return res.json({ cached: true, ...cached });
-
-  /* ================= FETCH RSS ================= */
-  const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(
-    q
-  )}&hl=en-IN&gl=IN&ceid=IN:en`;
-
-  const feed = await parser.parseURL(rssUrl);
-
-  const results = feed.items.slice(0, limit).map(item => ({
-    title: item.title,
-    url: item.link,
-    publishedAt: item.pubDate,
-    source: item.source?.title || "Google News",
-    description: item.contentSnippet || ""
-  }));
-
-  /* ================= SUMMARIZE TOP ARTICLES ================= */
-  const summaries = [];
-  for (let i = 0; i < Math.min(N_FULL, results.length); i++) {
-    const r = results[i];
-    const text = `${r.title}. ${r.description}`;
-    const s = await summarizeWithPollinations(text);
-    if (s) summaries.push(s);
+  if (!url) {
+    return res.status(400).json({ error: "Missing ?url parameter" });
   }
 
-  const merged = summaries.length
-    ? await mergeSummaries(q, summaries)
-    : null;
+  const cacheKey = `scrape:${hash(url)}`;
+  const cached = CACHE.get(cacheKey);
+  if (cached) {
+    return res.json({ success: true, cached: true, ...cached });
+  }
 
-  const response = {
-    success: true,
-    query: q,
-    detectedCategory: "general",
-    results: results.map(r => ({ title: r.title, url: r.url })),
-    unifiedSummary: {
-      mergedSummary: merged?.mergedSummary || null,
-      points: merged?.points || []
-    },
-    timeMs: Date.now() - start
-  };
+  try {
+    const resolvedUrl = await resolveGoogleNewsUrl(url);
 
-  setCache(cacheKey, response);
-  res.json(response);
+    const response = await breaker.exec(() =>
+      axios.get(resolvedUrl, {
+        timeout: 15000,
+        maxRedirects: 5,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        }
+      })
+    );
+
+    const $ = cheerio.load(response.data || "");
+    const extractor = new FullContentExtractor($);
+
+    const raw = extractor.extractText();
+    const text = cleanText(raw);
+    const meta = extractor.metadata();
+    const images = extractImages($, resolvedUrl);
+
+    const result = {
+      originalUrl: url,
+      resolvedUrl,
+      metadata: meta,
+      fullText: text,
+      images,
+      stats: {
+        words: text.split(/\s+/).length,
+        chars: text.length,
+        images: images.length,
+        timeMs: Date.now() - start
+      }
+    };
+
+    CACHE.set(cacheKey, result, DEFAULT_TTL);
+    res.json({ success: true, cached: false, ...result });
+  } catch (e) {
+    res.status(500).json({
+      error: "Scraping failed",
+      message: e.message
+    });
+  }
 }
