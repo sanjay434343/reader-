@@ -11,17 +11,21 @@ class LRUCache {
     this.cache = new Map();
     this.maxSize = maxSize;
   }
+
   get(key) {
     if (!this.cache.has(key)) return null;
-    const e = this.cache.get(key);
-    if (Date.now() - e.timestamp > e.ttl) {
+
+    const entry = this.cache.get(key);
+    if (Date.now() - entry.timestamp > entry.ttl) {
       this.cache.delete(key);
       return null;
     }
+
     this.cache.delete(key);
-    this.cache.set(key, e);
-    return e.data;
+    this.cache.set(key, entry);
+    return entry.data;
   }
+
   set(key, data, ttl) {
     if (this.cache.size >= this.maxSize) {
       this.cache.delete(this.cache.keys().next().value);
@@ -37,8 +41,8 @@ const DEFAULT_TTL = 10 * 60 * 1000;
    HELPERS
 ============================================================ */
 
-const hash = txt =>
-  createHash("md5").update(txt).digest("hex").slice(0, 16);
+const hash = text =>
+  createHash("md5").update(text).digest("hex").slice(0, 16);
 
 /* ============================================================
    GOOGLE NEWS URL RESOLVER
@@ -53,7 +57,7 @@ async function resolveGoogleNewsUrl(url) {
       maxRedirects: 5,
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
       }
     });
 
@@ -63,19 +67,21 @@ async function resolveGoogleNewsUrl(url) {
       $('link[rel="canonical"]').attr("href") ||
       $('meta[property="og:url"]').attr("content");
 
-    if (canonical?.startsWith("http")) return canonical;
+    if (canonical && canonical.startsWith("http")) {
+      return canonical;
+    }
 
     const refresh = $('meta[http-equiv="refresh"]').attr("content");
     if (refresh) {
-      const m = refresh.match(/url=(.*)/i);
-      if (m?.[1]) return m[1].trim();
+      const match = refresh.match(/url=(.*)/i);
+      if (match && match[1]) return match[1].trim();
     }
 
-    let fallback;
+    let fallback = null;
     $("a").each((_, el) => {
-      const h = $(el).attr("href");
-      if (h && h.startsWith("http") && !h.includes("google")) {
-        fallback = h;
+      const href = $(el).attr("href");
+      if (href && href.startsWith("http") && !href.includes("google")) {
+        fallback = href;
         return false;
       }
     });
@@ -103,18 +109,19 @@ class CircuitBreaker {
     if (this.state === "OPEN" && Date.now() < this.nextTry) {
       throw new Error("Circuit breaker open");
     }
+
     try {
-      const r = await fn();
+      const result = await fn();
       this.failures = 0;
       this.state = "CLOSED";
-      return r;
-    } catch (e) {
+      return result;
+    } catch (err) {
       this.failures++;
       if (this.failures >= this.limit) {
         this.state = "OPEN";
         this.nextTry = Date.now() + this.timeout;
       }
-      throw e;
+      throw err;
     }
   }
 }
@@ -122,7 +129,7 @@ class CircuitBreaker {
 const breaker = new CircuitBreaker();
 
 /* ============================================================
-   CONTENT EXTRACTION + CLEANING
+   CONTENT EXTRACTION
 ============================================================ */
 
 class FullContentExtractor {
@@ -139,28 +146,33 @@ class FullContentExtractor {
     ].forEach(s => $(s).remove());
 
     const priority = [
-      "article","main","[role='main']",
-      ".article-content",".story-content",".entry-content",
-      ".post-content",".article-body"
+      "article",
+      "main",
+      "[role='main']",
+      ".article-content",
+      ".story-content",
+      ".entry-content",
+      ".post-content",
+      ".article-body"
     ];
 
-    for (const s of priority) {
-      const el = $(s);
+    for (const selector of priority) {
+      const el = $(selector);
       if (el.length && el.text().length > 300) {
         return el.text().trim();
       }
     }
 
-    const ps = [];
+    const paragraphs = [];
     $("p").each((_, el) => {
-      const t = $(el).text().trim();
-      if (t.length > 25) ps.push(t);
+      const text = $(el).text().trim();
+      if (text.length > 25) paragraphs.push(text);
     });
 
-    return ps.join(" ");
+    return paragraphs.join(" ");
   }
 
-  metadata() {
+  extractMetadata() {
     const $ = this.$;
     return {
       title:
@@ -185,6 +197,10 @@ class FullContentExtractor {
   }
 }
 
+/* ============================================================
+   TEXT CLEANER
+============================================================ */
+
 function cleanText(text) {
   return text
     .replace(/\s+/g, " ")
@@ -193,7 +209,7 @@ function cleanText(text) {
 }
 
 /* ============================================================
-   MEDIA EXTRACTION
+   IMAGE EXTRACTION
 ============================================================ */
 
 function extractImages($, baseUrl) {
@@ -208,7 +224,10 @@ function extractImages($, baseUrl) {
       src = new URL(src, baseUrl).href;
       if (!seen.has(src)) {
         seen.add(src);
-        images.push({ src, alt: $(el).attr("alt") || "" });
+        images.push({
+          src,
+          alt: $(el).attr("alt") || ""
+        });
       }
     } catch {}
   });
@@ -217,7 +236,7 @@ function extractImages($, baseUrl) {
 }
 
 /* ============================================================
-   SERVERLESS HANDLER (VERCEL)
+   VERCEL SERVERLESS HANDLER
 ============================================================ */
 
 export default async function handler(req, res) {
@@ -225,19 +244,26 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
 
-  const start = Date.now();
+  const startTime = Date.now();
   const { url } = req.query;
 
   if (!url) {
     return res.status(400).json({ error: "Missing ?url parameter" });
   }
 
-  const cacheKey = `scrape:${hash(url)}`;
+  const cacheKey = `search:${hash(url)}`;
   const cached = CACHE.get(cacheKey);
+
   if (cached) {
-    return res.json({ success: true, cached: true, ...cached });
+    return res.json({
+      success: true,
+      cached: true,
+      ...cached
+    });
   }
 
   try {
@@ -249,7 +275,7 @@ export default async function handler(req, res) {
         maxRedirects: 5,
         headers: {
           "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
       })
     );
@@ -257,31 +283,36 @@ export default async function handler(req, res) {
     const $ = cheerio.load(response.data || "");
     const extractor = new FullContentExtractor($);
 
-    const raw = extractor.extractText();
-    const text = cleanText(raw);
-    const meta = extractor.metadata();
+    const rawText = extractor.extractText();
+    const cleanedText = cleanText(rawText);
+    const metadata = extractor.extractMetadata();
     const images = extractImages($, resolvedUrl);
 
     const result = {
       originalUrl: url,
       resolvedUrl,
-      metadata: meta,
-      fullText: text,
+      metadata,
+      fullText: cleanedText,
       images,
       stats: {
-        words: text.split(/\s+/).length,
-        chars: text.length,
+        words: cleanedText.split(/\s+/).length,
+        chars: cleanedText.length,
         images: images.length,
-        timeMs: Date.now() - start
+        processingTimeMs: Date.now() - startTime
       }
     };
 
     CACHE.set(cacheKey, result, DEFAULT_TTL);
-    res.json({ success: true, cached: false, ...result });
-  } catch (e) {
-    res.status(500).json({
-      error: "Scraping failed",
-      message: e.message
+
+    return res.json({
+      success: true,
+      cached: false,
+      ...result
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error: "Search failed",
+      message: err.message
     });
   }
 }
