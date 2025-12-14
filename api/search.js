@@ -1,238 +1,44 @@
-import axios from "axios";
-import * as cheerio from "cheerio";
+import Parser from "rss-parser";
 import { createHash } from "crypto";
 
+const parser = new Parser();
+
 /* ============================================================
-   LRU CACHE (SERVERLESS SAFE – WARM ONLY)
+   SIMPLE CACHE (SERVERLESS WARM ONLY)
 ============================================================ */
 
-class LRUCache {
-  constructor(maxSize = 100) {
-    this.cache = new Map();
-    this.maxSize = maxSize;
+const CACHE = new Map();
+const TTL = 5 * 60 * 1000; // 5 minutes
+
+function getCache(key) {
+  const c = CACHE.get(key);
+  if (!c) return null;
+  if (Date.now() - c.time > TTL) {
+    CACHE.delete(key);
+    return null;
   }
-
-  get(key) {
-    if (!this.cache.has(key)) return null;
-    const entry = this.cache.get(key);
-
-    if (Date.now() - entry.timestamp > entry.ttl) {
-      this.cache.delete(key);
-      return null;
-    }
-
-    this.cache.delete(key);
-    this.cache.set(key, entry);
-    return entry.data;
-  }
-
-  set(key, data, ttl) {
-    if (this.cache.size >= this.maxSize) {
-      this.cache.delete(this.cache.keys().next().value);
-    }
-    this.cache.set(key, { data, ttl, timestamp: Date.now() });
-  }
+  return c.data;
 }
 
-const CACHE = new LRUCache(100);
-const DEFAULT_TTL = 10 * 60 * 1000;
-
-/* ============================================================
-   HELPERS
-============================================================ */
-
-const hash = text =>
-  createHash("md5").update(text).digest("hex").slice(0, 16);
-
-/* ============================================================
-   GOOGLE NEWS URL RESOLVER
-============================================================ */
-
-async function resolveGoogleNewsUrl(url) {
-  if (!url.includes("news.google.com")) return url;
-
-  try {
-    const res = await axios.get(url, {
-      timeout: 12000,
-      maxRedirects: 5,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-      }
-    });
-
-    const $ = cheerio.load(res.data || "");
-
-    const canonical =
-      $('link[rel="canonical"]').attr("href") ||
-      $('meta[property="og:url"]').attr("content");
-
-    if (canonical && canonical.startsWith("http")) {
-      return canonical;
-    }
-
-    const refresh = $('meta[http-equiv="refresh"]').attr("content");
-    if (refresh) {
-      const match = refresh.match(/url=(.*)/i);
-      if (match && match[1]) return match[1].trim();
-    }
-
-    let fallback = null;
-    $("a").each((_, el) => {
-      const href = $(el).attr("href");
-      if (href && href.startsWith("http") && !href.includes("google")) {
-        fallback = href;
-        return false;
-      }
-    });
-
-    return fallback || url;
-  } catch {
-    return url;
-  }
+function setCache(key, data) {
+  CACHE.set(key, { data, time: Date.now() });
 }
 
-/* ============================================================
-   CIRCUIT BREAKER (SERVERLESS SAFE)
-============================================================ */
-
-class CircuitBreaker {
-  constructor(limit = 5, timeout = 60000) {
-    this.failures = 0;
-    this.limit = limit;
-    this.timeout = timeout;
-    this.state = "CLOSED";
-    this.nextTry = 0;
-  }
-
-  async exec(fn) {
-    if (this.state === "OPEN" && Date.now() < this.nextTry) {
-      throw new Error("Circuit breaker open");
-    }
-
-    try {
-      const result = await fn();
-      this.failures = 0;
-      this.state = "CLOSED";
-      return result;
-    } catch (err) {
-      this.failures++;
-      if (this.failures >= this.limit) {
-        this.state = "OPEN";
-        this.nextTry = Date.now() + this.timeout;
-      }
-      throw err;
-    }
-  }
-}
-
-const breaker = new CircuitBreaker();
+const hash = s =>
+  createHash("md5").update(s).digest("hex").slice(0, 12);
 
 /* ============================================================
-   CONTENT EXTRACTION
+   GOOGLE NEWS SEARCH (RSS)
 ============================================================ */
 
-class FullContentExtractor {
-  constructor($) {
-    this.$ = $;
-  }
-
-  extractText() {
-    const $ = this.$;
-
-    [
-      "script","style","noscript","header","footer","nav","aside",
-      "form",".ads",".promo",".share",".comment",".sidebar"
-    ].forEach(s => $(s).remove());
-
-    const priority = [
-      "article",
-      "main",
-      "[role='main']",
-      ".article-content",
-      ".story-content",
-      ".entry-content",
-      ".post-content",
-      ".article-body"
-    ];
-
-    for (const selector of priority) {
-      const el = $(selector);
-      if (el.length && el.text().length > 300) {
-        return el.text().trim();
-      }
-    }
-
-    const paragraphs = [];
-    $("p").each((_, el) => {
-      const text = $(el).text().trim();
-      if (text.length > 25) paragraphs.push(text);
-    });
-
-    return paragraphs.join(" ");
-  }
-
-  extractMetadata() {
-    const $ = this.$;
-    return {
-      title:
-        $('meta[property="og:title"]').attr("content") ||
-        $("title").text() ||
-        $("h1").first().text() ||
-        "",
-      description:
-        $('meta[property="og:description"]').attr("content") ||
-        $('meta[name="description"]').attr("content") ||
-        "",
-      author:
-        $('meta[name="author"]').attr("content") ||
-        "",
-      publishDate:
-        $('meta[property="article:published_time"]').attr("content") ||
-        "",
-      siteName:
-        $('meta[property="og:site_name"]').attr("content") ||
-        ""
-    };
-  }
-}
-
-/* ============================================================
-   TEXT CLEANER
-============================================================ */
-
-function cleanText(text) {
-  return text
-    .replace(/\s+/g, " ")
-    .replace(/ADVERTISEMENT|Subscribe|Related Articles/gi, "")
-    .trim();
-}
-
-/* ============================================================
-   IMAGE EXTRACTION
-============================================================ */
-
-function extractImages($, baseUrl) {
-  const images = [];
-  const seen = new Set();
-
-  $("img").each((_, el) => {
-    let src = $(el).attr("src") || $(el).attr("data-src");
-    if (!src) return;
-
-    try {
-      src = new URL(src, baseUrl).href;
-      if (!seen.has(src)) {
-        seen.add(src);
-        images.push({
-          src,
-          alt: $(el).attr("alt") || ""
-        });
-      }
-    } catch {}
-  });
-
-  return images;
+function buildGoogleNewsRSS({
+  q,
+  lang = "en",
+  country = "IN"
+}) {
+  return `https://news.google.com/rss/search?q=${encodeURIComponent(
+    q
+  )}&hl=${lang}-${country}&gl=${country}&ceid=${country}:${lang}`;
 }
 
 /* ============================================================
@@ -248,16 +54,23 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  const startTime = Date.now();
-  const { url } = req.query;
+  const {
+    q,
+    limit = 20,
+    lang = "en",
+    country = "IN"
+  } = req.query;
 
-  if (!url) {
-    return res.status(400).json({ error: "Missing ?url parameter" });
+  if (!q) {
+    return res.status(400).json({
+      error: "Missing ?q parameter",
+      example:
+        "/api/search?q=recent bomb attack in delhi"
+    });
   }
 
-  const cacheKey = `search:${hash(url)}`;
-  const cached = CACHE.get(cacheKey);
-
+  const cacheKey = hash(`${q}|${limit}|${lang}|${country}`);
+  const cached = getCache(cacheKey);
   if (cached) {
     return res.json({
       success: true,
@@ -267,42 +80,24 @@ export default async function handler(req, res) {
   }
 
   try {
-    const resolvedUrl = await resolveGoogleNewsUrl(url);
+    const rssUrl = buildGoogleNewsRSS({ q, lang, country });
+    const feed = await parser.parseURL(rssUrl);
 
-    const response = await breaker.exec(() =>
-      axios.get(resolvedUrl, {
-        timeout: 15000,
-        maxRedirects: 5,
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-      })
-    );
-
-    const $ = cheerio.load(response.data || "");
-    const extractor = new FullContentExtractor($);
-
-    const rawText = extractor.extractText();
-    const cleanedText = cleanText(rawText);
-    const metadata = extractor.extractMetadata();
-    const images = extractImages($, resolvedUrl);
+    const articles = feed.items.slice(0, Number(limit)).map(item => ({
+      title: item.title,
+      link: item.link,
+      publishedAt: item.pubDate,
+      source: item.source?.title || "Google News",
+      description: item.contentSnippet || ""
+    }));
 
     const result = {
-      originalUrl: url,
-      resolvedUrl,
-      metadata,
-      fullText: cleanedText,
-      images,
-      stats: {
-        words: cleanedText.split(/\s+/).length,
-        chars: cleanedText.length,
-        images: images.length,
-        processingTimeMs: Date.now() - startTime
-      }
+      query: q,
+      total: articles.length,
+      articles
     };
 
-    CACHE.set(cacheKey, result, DEFAULT_TTL);
+    setCache(cacheKey, result);
 
     return res.json({
       success: true,
@@ -311,7 +106,7 @@ export default async function handler(req, res) {
     });
   } catch (err) {
     return res.status(500).json({
-      error: "Search failed",
+      error: "Google News RSS fetch failed",
       message: err.message
     });
   }
