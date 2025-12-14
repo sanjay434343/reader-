@@ -3,7 +3,7 @@ import * as cheerio from "cheerio";
 import { createHash } from "crypto";
 
 /* ============================================================
-   LRU CACHE (SERVERLESS SAFE)
+   LRU CACHE (SERVERLESS SAFE – WARM ONLY)
 ============================================================ */
 
 class LRUCache {
@@ -14,8 +14,8 @@ class LRUCache {
 
   get(key) {
     if (!this.cache.has(key)) return null;
-
     const entry = this.cache.get(key);
+
     if (Date.now() - entry.timestamp > entry.ttl) {
       this.cache.delete(key);
       return null;
@@ -93,7 +93,7 @@ async function resolveGoogleNewsUrl(url) {
 }
 
 /* ============================================================
-   CIRCUIT BREAKER
+   CIRCUIT BREAKER (SERVERLESS SAFE)
 ============================================================ */
 
 class CircuitBreaker {
